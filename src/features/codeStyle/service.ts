@@ -43,13 +43,20 @@ export class CodeStyleService implements vscode.Disposable {
 		this.sources.register(new BslSourceProvider());
 		this.sources.register(new MetadataSourceProvider(context));
 		this.planner = new ScanPlanner(this.rules, this.sources, this.settings, this.engine, this.store);
-		this.scheduler = new ScanScheduler(this.planner, this.rules);
+		this.scheduler = new ScanScheduler(this.planner, this.rules, this.store);
 		this.publisher = new CodeStyleProblemsPublisher(this.store);
 		const actionContext: ActionContext = {
-			listRules: () => this.listRules(),
-			getSettings: (root) => this.getSettings(root),
-			getIssues: (filter) => this.getIssues(filter),
-			check: (scope) => this.scan(scope),
+			listRules: () => this.rules.list().map((rule) => ({
+				id: rule.id, title: rule.title, description: rule.description, area: rule.area,
+				category: rule.category, defaultSeverity: rule.defaultSeverity,
+				defaultEnabled: rule.defaultEnabled, sourceKinds: [...rule.sourceKinds],
+			})),
+			getSettings: (root) => {
+				const settings = this.getSettings(root);
+				return settings ? JSON.parse(JSON.stringify(settings)) as ProjectSettings : undefined;
+			},
+			getIssues: (filter) => JSON.parse(JSON.stringify(this.getIssues(filter))) as IssueQueryResult,
+			check: async (scope) => JSON.parse(JSON.stringify(await this.scan(scope))) as ScanResult,
 		};
 		this.dispatcher = new ActionDispatcher(this.actions, actionContext);
 		this.events = new CodeStyleEvents(this.rules, this.settings, this.store, this.scheduler,

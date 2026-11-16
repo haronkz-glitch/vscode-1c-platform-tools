@@ -1,5 +1,8 @@
+import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
+import { sameOrUnder } from '../../../shared/projectLayout';
 import { compareText } from './identity';
+import { persistedVersion } from './sourceVersion';
 import type {
 	CodeStyleError, Issue, IssueFilter, IssueQueryResult, PairStatus, ScanResult, SourceKind, StoreChange,
 	TargetDescriptor,
@@ -18,10 +21,26 @@ export interface CommitTicket {
 	readonly dependencies: readonly { uri: string; version: string; generation: number }[];
 	readonly cancellation: vscode.CancellationToken;
 }
+export interface AffectedPair {
+	readonly projectKey: string;
+	readonly ruleId: string;
+	readonly targetKey: string;
+	readonly targetUri: string;
+	readonly sourceKind: SourceKind;
+}
+export interface PairState {
+	readonly projectKey: string;
+	readonly ruleId: string;
+	readonly targetKey: string;
+	readonly status: PairStatus;
+	readonly stale: boolean;
+	readonly error?: CodeStyleError;
+}
 interface StoredPair {
 	readonly ticket: CommitTicket;
 	readonly issues: readonly Issue[];
 	readonly status: PairStatus;
+	lastSequence: number;
 	stale: boolean;
 	error?: CodeStyleError;
 }
@@ -39,7 +58,7 @@ const copyIssues = (issues: readonly Issue[]): Issue[] =>
 		fix: issue.fix ? { ...issue.fix } : undefined,
 	}));
 
-/** Single arbiter of freshness, replacing pairs atomically and indexing every affected URI. */
+/** The only arbiter of snapshot versions, settings revisions, and pair ordering. */
 export class IssueStore implements vscode.Disposable {
 	private readonly pairs = new Map<string, StoredPair>();
 	private readonly byUri = new Map<string, Set<string>>();
@@ -52,20 +71,20 @@ export class IssueStore implements vscode.Disposable {
 	private disposed = false;
 
 	readonly onDidChange = this.emitter.event;
-
 	fileGeneration(uri: string): number { return this.generation.get(uri) ?? 0; }
-	/** Used to suppress duplicate watcher/save events for the already-checked version. */
-	knownSourceVersion(uri: string): string | undefined {
-		for (const id of this.byUri.get(uri) ?? []) {
-			const pair = this.pairs.get(id);
-			if (pair && !pair.stale && pair.ticket.target.uri === uri) { return pair.ticket.sourceVersion; }
-		}
-		return undefined;
-	}
 	projectGeneration(key: string): number { return this.projectEpoch.get(key) ?? 0; }
 	inventoryRevision(key: string): number { return this.inventoryEpoch.get(key) ?? 0; }
 	bumpInventory(key: string): void {
 		if (!this.disposed) { this.inventoryEpoch.set(key, this.inventoryRevision(key) + 1); }
+	}
+	knownSourceVersion(uri: string): string | undefined {
+		for (const id of this.byUri.get(uri) ?? []) {
+			const pair = this.pairs.get(id);
+			if (pair && pair.status === 'completed' && !pair.stale && pair.ticket.target.uri === uri) {
+				return pair.ticket.sourceVersion;
+			}
+		}
+		return undefined;
 	}
 
 	ticket(input: Omit<CommitTicket, 'sourceGeneration' | 'projectGeneration' | 'dependencies'> & {
@@ -77,11 +96,8 @@ export class IssueStore implements vscode.Disposable {
 		};
 	}
 
-	/** Called only for selected rules in a specific project; unrelated revisions remain untouched. */
 	setRuleRevisions(projectKey: string, revisions: Readonly<Record<string, string>>): readonly string[] {
-		const affected = new Set<string>();
-		const uris = new Set<string>();
-		const rules = new Set<string>();
+		const affected = new Set<string>(), uris = new Set<string>(), rules = new Set<string>();
 		for (const [ruleId, revision] of Object.entries(revisions)) {
 			const key = configKey(projectKey, ruleId);
 			const previous = this.settings.get(key);
@@ -98,6 +114,7 @@ export class IssueStore implements vscode.Disposable {
 		if (affected.size) { this.fire('settings', uris, [projectKey], rules); }
 		return [...rules];
 	}
+
 	private isTicketCurrent(ticket: CommitTicket): boolean {
 		if (this.disposed || ticket.cancellation.isCancellationRequested ||
 			this.settings.get(configKey(ticket.projectKey, ticket.ruleId)) !== ticket.settingsRevision ||
@@ -107,11 +124,36 @@ export class IssueStore implements vscode.Disposable {
 			return false;
 		}
 		const previous = this.pairs.get(pairKey(ticket.projectKey, ticket.ruleId, ticket.target.targetKey));
-		return !previous || previous.ticket.sequence <= ticket.sequence;
+		return !previous || previous.lastSequence <= ticket.sequence;
+	}
+	/** Verify files and symlink boundaries inside Store rather than trusting the planner. */
+	private async verifyCurrentVersions(ticket: CommitTicket): Promise<boolean> {
+		if (!ticket.sourceVersion) { return false; }
+		const verify = async (uri: string, version: string, sourceRoot?: string): Promise<boolean> => {
+			try {
+				const parsed = vscode.Uri.parse(uri);
+				if (parsed.scheme !== 'file' || !sameOrUnder(parsed.fsPath, ticket.projectKey) ||
+					(sourceRoot && !sameOrUnder(parsed.fsPath, sourceRoot))) { return false; }
+				const [realProject, realFile, realSource] = await Promise.all([
+					fs.realpath(ticket.projectKey), fs.realpath(parsed.fsPath),
+					sourceRoot ? fs.realpath(sourceRoot) : Promise.resolve(undefined),
+				]);
+				if (!sameOrUnder(realFile, realProject) ||
+					(realSource && (!sameOrUnder(realSource, realProject) || !sameOrUnder(realFile, realSource)))) {
+					return false;
+				}
+				return (await persistedVersion(uri)) === version;
+			} catch { return false; }
+		};
+		if (!(await verify(ticket.target.uri, ticket.sourceVersion, ticket.target.sourceRoot))) { return false; }
+		for (const dependency of ticket.dependencies) {
+			if (!(await verify(dependency.uri, dependency.version))) { return false; }
+		}
+		return true;
 	}
 	private indexedUris(pair: StoredPair): Set<string> {
 		return new Set([pair.ticket.target.uri, ...pair.ticket.dependencies.map((dep) => dep.uri),
-			...pair.issues.flatMap((issue) => [issue.location.uri, ...(issue.relatedLocations ?? []).map((location) => location.uri)])]);
+			...pair.issues.flatMap((issue) => [issue.location.uri, ...(issue.relatedLocations ?? []).map((loc) => loc.uri)])]);
 	}
 	private reindex(key: string, previous?: StoredPair, next?: StoredPair): void {
 		if (previous) {
@@ -130,16 +172,18 @@ export class IssueStore implements vscode.Disposable {
 		}
 	}
 	private fire(reason: StoreChange['reason'], uris: Iterable<string>, projects: Iterable<string>, rules: Iterable<string>): void {
-		if (!this.disposed) {
-			try { this.emitter.fire({ reason, uris: [...new Set(uris)], projectKeys: [...new Set(projects)], ruleIds: [...new Set(rules)] }); }
-			catch { /* A subscriber cannot roll back an accepted commit. */ }
-		}
+		if (this.disposed) { return; }
+		try {
+			this.emitter.fire({ reason, uris: [...new Set(uris)], projectKeys: [...new Set(projects)], ruleIds: [...new Set(rules)] });
+		} catch { /* Subscriber failures cannot roll back commits. */ }
 	}
-	commit(ticket: CommitTicket, issues: readonly Issue[]): boolean {
-		if (!this.isTicketCurrent(ticket)) { return false; }
+	async commit(ticket: CommitTicket, issues: readonly Issue[]): Promise<boolean> {
+		if (!this.isTicketCurrent(ticket) || !(await this.verifyCurrentVersions(ticket)) ||
+			!this.isTicketCurrent(ticket)) { return false; }
 		const key = pairKey(ticket.projectKey, ticket.ruleId, ticket.target.targetKey);
 		const previous = this.pairs.get(key);
-		const next: StoredPair = { ticket, issues: copyIssues(issues), status: 'completed', stale: false };
+		const next: StoredPair = { ticket, issues: copyIssues(issues), status: 'completed',
+			lastSequence: ticket.sequence, stale: false };
 		this.reindex(key, previous, next);
 		this.pairs.set(key, next);
 		this.fire('commit', [...(previous?.issues.map((issue) => issue.location.uri) ?? []),
@@ -151,34 +195,53 @@ export class IssueStore implements vscode.Disposable {
 		const key = pairKey(ticket.projectKey, ticket.ruleId, ticket.target.targetKey);
 		const previous = this.pairs.get(key);
 		if (previous) {
-			// Failure does not replace an earlier success with an empty result.
 			previous.error = error;
+			previous.lastSequence = ticket.sequence;
+			return true;
 		}
+		const next: StoredPair = { ticket, issues: [], status,
+			lastSequence: ticket.sequence, stale: false, error };
+		this.reindex(key, undefined, next);
+		this.pairs.set(key, next);
 		return true;
 	}
-	/** Invalidate target, related source and diagnostic-location references immediately. */
-	invalidateUri(uri: string): void {
-		if (this.disposed) { return; }
+	/** A previously applicable rule can become inapplicable without a successful check. */
+	deactivatePair(ticket: CommitTicket): void {
+		if (!this.isTicketCurrent(ticket)) { return; }
+		const key = pairKey(ticket.projectKey, ticket.ruleId, ticket.target.targetKey);
+		const previous = this.pairs.get(key);
+		if (!previous || previous.stale) { return; }
+		previous.stale = true;
+		previous.lastSequence = ticket.sequence;
+		this.fire('invalidate', previous.issues.map((issue) => issue.location.uri),
+			[ticket.projectKey], [ticket.ruleId]);
+	}
+	/** Return affected target/rule pairs so the coordinator can reschedule dependencies. */
+	invalidateUri(uri: string): readonly AffectedPair[] {
+		if (this.disposed) { return []; }
 		this.generation.set(uri, this.fileGeneration(uri) + 1);
-		const uris = new Set<string>();
-		const projects = new Set<string>();
-		const rules = new Set<string>();
+		const uris = new Set<string>(), projects = new Set<string>(), rules = new Set<string>();
+		const affected: AffectedPair[] = [];
 		for (const key of this.byUri.get(uri) ?? []) {
 			const pair = this.pairs.get(key);
-			if (!pair || pair.stale) { continue; }
+			if (!pair) { continue; }
+			affected.push({
+				projectKey: pair.ticket.projectKey, ruleId: pair.ticket.ruleId,
+				targetKey: pair.ticket.target.targetKey, targetUri: pair.ticket.target.uri,
+				sourceKind: pair.ticket.target.sourceKind,
+			});
+			if (pair.stale) { continue; }
 			pair.stale = true;
 			projects.add(pair.ticket.projectKey);
 			rules.add(pair.ticket.ruleId);
 			for (const issue of pair.issues) { uris.add(issue.location.uri); }
 		}
 		this.fire('invalidate', uris, projects, rules);
+		return affected;
 	}
-	/** Deletion is confirmed by the caller; affected dependency results become stale. */
-	removeUri(uri: string): void {
-		this.invalidateUri(uri);
-		const uris = new Set<string>();
-		const projects = new Set<string>();
-		const rules = new Set<string>();
+	removeUri(uri: string): readonly AffectedPair[] {
+		const affected = this.invalidateUri(uri);
+		const uris = new Set<string>(), projects = new Set<string>(), rules = new Set<string>();
 		for (const key of [...(this.byUri.get(uri) ?? [])]) {
 			const pair = this.pairs.get(key);
 			if (!pair || pair.ticket.target.uri !== uri) { continue; }
@@ -189,12 +252,13 @@ export class IssueStore implements vscode.Disposable {
 			this.pairs.delete(key);
 		}
 		this.fire('remove', uris, projects, rules);
+		return affected.filter((pair) => pair.targetUri !== uri);
 	}
 	invalidateProject(key: string, inventoryChanged = true): void {
+		if (this.disposed) { return; }
 		this.projectEpoch.set(key, this.projectGeneration(key) + 1);
-		if (inventoryChanged) { this.inventoryEpoch.set(key, this.inventoryRevision(key) + 1); }
-		const uris = new Set<string>();
-		const rules = new Set<string>();
+		if (inventoryChanged) { this.bumpInventory(key); }
+		const uris = new Set<string>(), rules = new Set<string>();
 		for (const pair of this.pairs.values()) {
 			if (pair.ticket.projectKey !== key || pair.stale) { continue; }
 			pair.stale = true;
@@ -206,8 +270,7 @@ export class IssueStore implements vscode.Disposable {
 	removeProject(key: string): void {
 		if (this.disposed) { return; }
 		this.invalidateProject(key);
-		const uris = new Set<string>();
-		const rules = new Set<string>();
+		const uris = new Set<string>(), rules = new Set<string>();
 		for (const [id, pair] of [...this.pairs]) {
 			if (pair.ticket.projectKey !== key) { continue; }
 			for (const issue of pair.issues) { uris.add(issue.location.uri); }
@@ -220,7 +283,7 @@ export class IssueStore implements vscode.Disposable {
 		}
 		this.fire('remove', uris, [key], rules);
 	}
-	/** Prune only a complete, unchanged full inventory and only selected rule/kind pairs. */
+	/** Prune only an unchanged, complete inventory of selected rules/source kinds. */
 	reconcileFull(input: {
 		projectKey: string;
 		inventoryGeneration: number;
@@ -251,12 +314,13 @@ export class IssueStore implements vscode.Disposable {
 	}
 	recordScan(scan: ScanResult): void {
 		if (this.disposed) { return; }
-		this.scans.set(scan.runId, scan);
-		if (this.scans.size > 40) { this.scans.delete(this.scans.keys().next().value!); }
+		this.scans.set(scan.runId, JSON.parse(JSON.stringify(scan)) as ScanResult);
+		if (this.scans.size > 100) { this.scans.delete(this.scans.keys().next().value!); }
 	}
 	getIssues(filter: IssueFilter = {}): readonly Issue[] {
 		const found: Issue[] = [];
 		for (const pair of this.pairs.values()) {
+			if (pair.status !== 'completed') { continue; }
 			if (filter.status !== 'all' && filter.status !== 'stale' && pair.stale) { continue; }
 			if (filter.status === 'stale' && !pair.stale) { continue; }
 			if (filter.projectKey && pair.ticket.projectKey !== filter.projectKey) { continue; }
@@ -278,15 +342,54 @@ export class IssueStore implements vscode.Disposable {
 			compareText(a.ruleId, b.ruleId) || compareText(a.id, b.id));
 		return copyIssues(found);
 	}
+	getPairStates(filter: IssueFilter = {}): readonly PairState[] {
+		return [...this.pairs.values()].filter((pair) =>
+			(!filter.projectKey || filter.projectKey === pair.ticket.projectKey) &&
+			(!filter.sourceKey || filter.sourceKey === pair.ticket.target.sourceKey) &&
+			(!filter.targetKey || filter.targetKey === pair.ticket.target.targetKey) &&
+			(!filter.ruleId || filter.ruleId === pair.ticket.ruleId) &&
+			(!filter.uri || this.indexedUris(pair).has(filter.uri))
+		).map((pair) => ({
+			projectKey: pair.ticket.projectKey, ruleId: pair.ticket.ruleId,
+			targetKey: pair.ticket.target.targetKey, status: pair.status, stale: pair.stale,
+			error: pair.error ? { ...pair.error } : undefined,
+		})).sort((a, b) => compareText(a.projectKey, b.projectKey) ||
+			compareText(a.targetKey, b.targetKey) || compareText(a.ruleId, b.ruleId));
+	}
 	query(filter: IssueFilter = {}): IssueQueryResult {
-		// Current status is the last result of each project, not a conjunction of historic failures.
-		const latest = new Map<string, ScanResult>();
+		// Keep the newest full scope separately from partial updates; partial success
+		// cannot erase outstanding failures from a prior full inventory.
+		const last = new Map<string, ScanResult>();
 		for (const scan of this.scans.values()) {
-			if (!filter.projectKey || scan.projectKey === filter.projectKey) { latest.set(scan.projectKey, scan); }
+			if (filter.projectKey && scan.projectKey !== filter.projectKey) { continue; }
+			const key = JSON.stringify([scan.projectKey, scan.requested.mode]);
+			const previous = last.get(key);
+			const order = (value: ScanResult) => Number(value.runId.split('-').at(-1)) || 0;
+			if (!previous || order(scan) >= order(previous)) { last.set(key, scan); }
 		}
-		const scans = [...latest.values()];
-		return { issues: this.getIssues(filter), scans, errors: scans.flatMap((scan) => scan.errors),
-			complete: scans.length > 0 && scans.every((scan) => scan.complete) };
+		const newest = (scan: ScanResult): number => Number(scan.runId.split('-').at(-1)) || 0;
+		const full = new Map<string, ScanResult>();
+		for (const scan of last.values()) {
+			if (scan.requested.mode === 'full') { full.set(scan.projectKey, scan); }
+		}
+		const scans = [...last.values()].filter((scan) =>
+			scan.requested.mode === 'full' || !full.has(scan.projectKey) ||
+			newest(scan) > newest(full.get(scan.projectKey)!)
+		).map((scan) => JSON.parse(JSON.stringify(scan)) as ScanResult);
+		const states = this.getPairStates(filter);
+		const projects = new Set([...scans.map((scan) => scan.projectKey), ...states.map((state) => state.projectKey)]);
+		const stateComplete = states.every((state) => state.status === 'completed' && !state.stale && !state.error);
+		const selected = filter.targetKey || filter.uri
+			? states.length > 0 && stateComplete
+			: projects.size > 0 && [...projects].every((projectKey) => {
+				const whole = full.get(projectKey);
+				return whole ? whole.complete : scans.some((scan) =>
+					scan.projectKey === projectKey && scan.status === 'noApplicableRules');
+			}) && stateComplete;
+		const errors = [...states.flatMap((state) => state.error ? [state.error] : []),
+			...scans.flatMap((scan) => scan.errors).filter((error) =>
+				!filter.targetKey || !error.targetKey || error.targetKey === filter.targetKey)];
+		return { issues: this.getIssues(filter), scans, pairStates: states, errors, complete: selected };
 	}
 	dispose(): void {
 		if (this.disposed) { return; }

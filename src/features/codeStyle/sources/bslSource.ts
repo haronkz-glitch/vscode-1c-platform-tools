@@ -4,8 +4,9 @@ import { createHash } from 'node:crypto';
 import * as vscode from 'vscode';
 import { sameOrUnder } from '../../../shared/projectLayout';
 import { stableHash, targetCompare, targetKeyOf } from '../core/identity';
+import { SourceDataError } from '../core/sourceVersion';
 import type { CodeStyleError, ProjectRef, SourceInventory, SourceProvider, SourceSelection, TargetDescriptor, TargetSnapshot } from '../core/types';
-import { ensureSafeFile, filePath, fileUri, sourceForFile, sourceRoots } from './projectSource';
+import { ensureSafeFile, filePath, fileUri, sourceForFile, sourceRoots, sameFile } from './projectSource';
 
 // Layout discovery deliberately skips "Ext"; BSL scanning MUST NOT copy that exclusion.
 const SKIP = new Set(['node_modules', 'oscript_modules', '.git', '.vscode', 'out', 'build', 'dist', 'target', 'coverage']);
@@ -36,7 +37,12 @@ export class BslSourceProvider implements SourceProvider {
 			const source = sourceForFile(project, file);
 			if (!source || skipBslDirectory(project, path.dirname(file))) { return; }
 			const requestedKey = targetKeyOf(source, this.kind, file);
-			if (selection.targetKeys && !selection.targetKeys.includes(requestedKey)) { return; }
+			if ((selection.targetKeys || selection.files) &&
+				!selection.targetKeys?.includes(requestedKey) &&
+				!selection.files?.some((uri) => {
+					const requested = filePath(uri);
+					return requested !== undefined && sameFile(requested, file);
+				})) { return; }
 			try {
 				await ensureSafeFile(project, file, source);
 				const targetKey = targetKeyOf(source, this.kind, file);
@@ -53,11 +59,11 @@ export class BslSourceProvider implements SourceProvider {
 			}
 		};
 		if (selection.files || selection.targetKeys) {
-			const files = selection.files ?? selection.targetKeys!.map((key) => {
+			const files = [...(selection.files ?? []), ...(selection.targetKeys ?? []).map((key) => {
 				const marker = '|bsl|';
 				const i = key.lastIndexOf(marker);
 				return i < 0 ? '' : fileUri(key.slice(i + marker.length));
-			});
+			})];
 			for (const uri of files) {
 				if (token.isCancellationRequested) { complete = false; break; }
 				const file = filePath(uri);
@@ -91,7 +97,18 @@ export class BslSourceProvider implements SourceProvider {
 			for (const root of sourceRoots(project)) {
 				if (token.isCancellationRequested) { complete = false; break; }
 				if (!sameOrUnder(root.root, project.root)) { continue; }
-				await walk(root.root);
+				try {
+					const [realProject, realSource] = await Promise.all([
+						fs.realpath(project.root), fs.realpath(root.root),
+					]);
+					if (!sameOrUnder(realSource, realProject)) {
+						throw new Error('Корень BSL-источника выходит за границу проекта.');
+					}
+					await walk(root.root);
+				} catch (error) {
+					complete = false;
+					errors.push({ code: 'bslSourceUnavailable', projectKey: project.key, message: String(error) });
+				}
 			}
 		}
 		targets.sort(targetCompare);
@@ -104,10 +121,11 @@ export class BslSourceProvider implements SourceProvider {
 		const source = file && sourceForFile(project, file);
 		if (!file || !source || source.key !== target.sourceKey) { throw new Error('BSL-цель больше не принадлежит источнику.'); }
 		const open = vscode.workspace.textDocuments.find((document) => document.uri.toString() === target.uri);
-		if (open?.isDirty) { throw new Error('Файл BSL не сохранён.'); }
+		if (open?.isDirty) { throw new SourceDataError('dirtySource', 'Файл BSL не сохранён.'); }
 		await ensureSafeFile(project, file, source);
 		const bytes = await fs.readFile(file);
-		if (token.isCancellationRequested || open?.isDirty) { throw new Error('Операция отменена или файл изменён.'); }
+		if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
+		if (open?.isDirty) { throw new SourceDataError('dirtySource', 'Файл BSL изменён в редакторе.'); }
 		return {
 			kind: this.kind, uri: target.uri,
 			version: createHash('sha1').update(bytes).digest('hex'),

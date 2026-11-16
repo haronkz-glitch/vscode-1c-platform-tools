@@ -7,6 +7,7 @@ import { runMdSparrowParamsRead, type MdSparrowParams } from '../../metadata/mdS
 import { metadataFileVersion } from '../../metadata/metadataFileChanges';
 import { mdSparrowSchemaFlagFromConfigurationXml, designerXmlVersionToMdSparrowFlag } from '../../metadata/mdSparrowSchemaVersion';
 import { stableHash, targetCompare, targetKeyOf } from '../core/identity';
+import { SourceDataError } from '../core/sourceVersion';
 import type { CodeStyleError, ProjectRef, SourceInventory, SourceProvider, SourceSelection, TargetDescriptor, TargetSnapshot, SourceRef } from '../core/types';
 import { ensureSafeFile, filePath, fileUri, sourceForFile, sourceRoots, sameFile } from './projectSource';
 
@@ -52,15 +53,24 @@ export class MetadataSourceProvider implements SourceProvider {
 		const errors: CodeStyleError[] = [];
 		let complete = true;
 		let tree: ProjectMetadataTreeDto;
+		const expectedRoots = sourceRoots(project).filter((root) =>
+			root.kind === 'configuration' || root.kind === 'extension'
+		);
+		const noConfigurations = expectedRoots.length === 0;
 		try {
 			// A project containing only external artifacts cannot provide a configuration tree.
-			tree = !project.layout.configuration && !project.layout.others.length && !project.layout.extensions.length
+			tree = noConfigurations
 				? fallbackExternals(project)
 				: await loadProjectMetadataTree(this.extensionContext, project.root);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (!project.layout.configuration && message.startsWith('Нет ни выгрузки конфигуратора')) {
 				tree = fallbackExternals(project);
+				if (!noConfigurations) {
+					// md-sparrow did not enumerate extension metadata: report partial inventory.
+					complete = false;
+					errors.push({ code: 'metadataTreeIncomplete', projectKey: project.key, message });
+				}
 			} else {
 				return { targets: [], revision: '', complete: false,
 					errors: [{ code: 'metadataTreeFailed', message, projectKey: project.key }] };
@@ -70,10 +80,10 @@ export class MetadataSourceProvider implements SourceProvider {
 			return { targets: [], revision: '', complete: false, errors: [{ code: 'cancelled', message: 'Отменено.', projectKey: project.key }] };
 		}
 		const push = async (descriptor: TargetDescriptor): Promise<void> => {
-			if (selection.files && !selection.files.some((uri) => sameFile(filePath(uri) ?? '', filePath(descriptor.uri) ?? ''))) {
-				return;
-			}
-			if (selection.targetKeys && !selection.targetKeys.includes(descriptor.targetKey)) { return; }
+			const byFile = selection.files?.some((uri) => filePath(uri) !== undefined &&
+				sameFile(filePath(uri)!, filePath(descriptor.uri) ?? '')) ?? false;
+			const byKey = selection.targetKeys?.includes(descriptor.targetKey) ?? false;
+			if ((selection.files || selection.targetKeys) && !byFile && !byKey) { return; }
 			try {
 				const file = filePath(descriptor.uri);
 				const source = file && sourceForFile(project, file);
@@ -137,30 +147,48 @@ export class MetadataSourceProvider implements SourceProvider {
 				}
 			}
 		}
+		// Never silently omit a recognized configuration/extension from the inventory.
+		for (const root of expectedRoots) {
+			const targetKey = targetKeyOf(root, this.kind, root.entry);
+			if (targets.some((target) => target.targetKey === targetKey)) { continue; }
+			complete = false;
+			errors.push({ code: 'metadataRootNotEnumerated', projectKey: project.key,
+				message: 'Дерево не содержит источник: ' + root.entry });
+			await push({
+				projectKey: project.key, sourceKey: root.key, targetKey, sourceKind: this.kind,
+				uri: fileUri(root.entry), sourceRoot: root.root, format: root.format,
+				objectType: root.kind === 'extension' ? 'ConfigurationExtension' : 'Configuration',
+				isSourceRoot: true, name: path.basename(root.root),
+				metadata: { configurationFile: root.entry, objectFile: root.entry },
+			});
+		}
 		const byKey = new Map(targets.map((target) => [target.targetKey, target]));
 		const sorted = [...byKey.values()].sort(targetCompare);
 		return { targets: sorted, complete, errors, revision: stableHash(...sorted.map((target) => target.targetKey)) };
 	}
 
 	async read(project: ProjectRef, target: TargetDescriptor, token: vscode.CancellationToken): Promise<TargetSnapshot> {
-		if (!target.metadata || target.metadata.schemaSupported === false) { throw new Error('metadata-цель не поддерживается.'); }
+		if (!target.metadata || target.metadata.schemaSupported === false) {
+			throw new SourceDataError('unsupportedSource', 'metadata-цель не поддерживается.');
+		}
 		const file = filePath(target.uri);
 		const source = file && sourceForFile(project, file);
 		if (!file || !source || source.key !== target.sourceKey) { throw new Error('metadata-цель больше не принадлежит источнику.'); }
 		await ensureSafeFile(project, file, source);
-		if (token.isCancellationRequested) { throw new Error('Операция отменена.'); }
+		if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
 		const version = await metadataFileVersion(file);
 		const config = target.metadata.configurationFile;
 		const isRoot = target.isSourceRoot === true;
+		const flagFile = source.kind === 'processor' || source.kind === 'report' ? file : (isRoot ? file : config);
 		const flag = target.metadata.schemaVersion ??
-			await mdSparrowSchemaFlagFromConfigurationXml(isRoot ? file : config);
+			await mdSparrowSchemaFlagFromConfigurationXml(flagFile);
 		const params: MdSparrowParams = isRoot
 			? { op: 'cf-configuration-properties-get', configurationXml: file, schemaVersion: flag }
 			: { op: 'cf-md-object-get', objectXml: file, schemaVersion: flag };
 		const runtime = await ensureMdSparrowRuntime(this.extensionContext, project.root);
-		if (token.isCancellationRequested) { throw new Error('Операция отменена.'); }
+		if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
 		const result = await runMdSparrowParamsRead(runtime, params, { cwd: project.root, token });
-		if (token.isCancellationRequested) { throw new Error('Операция отменена.'); }
+		if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
 		if (result.exitCode !== 0) { throw new Error(result.stderr.trim() || result.stdout.trim() || 'md-sparrow завершился с ошибкой.'); }
 		if ((await metadataFileVersion(file)) !== version) { throw new Error('metadata-объект изменился во время чтения.'); }
 		let dto: unknown;

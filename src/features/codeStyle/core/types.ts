@@ -136,8 +136,9 @@ export interface RuleContext {
 	readonly project: ProjectRef;
 	readonly target: TargetDescriptor;
 	readonly settings: EffectiveRuleSettings;
-	/** Source version is resolved by read(); metadata-only rules may use the descriptor without it. */
+	/** Version of the persisted target snapshot, available even without detailed read(). */
 	readonly cancellation: vscode.CancellationToken;
+	readonly sourceVersion: string;
 	read(): Promise<TargetSnapshot>;
 	/** Only existing files belonging to the same project may be requested. */
 	readRelated(uri: string): Promise<DependencySnapshot>;
@@ -200,6 +201,7 @@ export interface IssueFilter {
 export interface IssueQueryResult {
 	readonly issues: readonly Issue[];
 	readonly scans: readonly ScanResult[];
+	readonly pairStates: readonly { projectKey: string; ruleId: string; targetKey: string; status: PairStatus; stale: boolean; error?: CodeStyleError }[];
 	readonly errors: readonly CodeStyleError[];
 	readonly complete: boolean;
 }

@@ -1,55 +1,97 @@
 import * as vscode from 'vscode';
 import { logger } from '../../../shared/logger';
 import { projectKeyOf } from './identity';
-import type { ScanResult, ScanScope } from './types';
+import type { ScanResult, ScanScope, SourceKind } from './types';
 import { ScanPlanner } from './scanPlanner';
 import { RuleRegistry } from './ruleRegistry';
+import { IssueStore } from './issueStore';
 
 const log = logger.scope('code-style');
-
 interface Job {
-	readonly scope: ScanScope;
+	scope: ScanScope;
 	readonly sequence: number;
 	readonly runId: string;
+	readonly background: boolean;
 	readonly source: vscode.CancellationTokenSource;
 	readonly resolve: (result: ScanResult) => void;
+	readonly completion: Promise<ScanResult>;
 }
 interface Pending {
 	readonly root: string;
-	mode: 'full' | 'partial';
-	files: Set<string>;
-	ruleIds?: Set<string>;
+	scope: ScanScope;
+	timer?: NodeJS.Timeout;
+}
+function combined(left: readonly string[] | undefined, right: readonly string[] | undefined): readonly string[] | undefined {
+	return left && right ? [...new Set([...left, ...right])] : undefined;
+}
+function mergeScopes(left: ScanScope, right: ScanScope): ScanScope {
+	const full = left.mode === 'full' || right.mode === 'full';
+	return {
+		projectRoot: left.projectRoot,
+		mode: full ? 'full' : 'partial',
+		files: full ? undefined : [...new Set([...(left.files ?? []), ...(right.files ?? [])])],
+		targetKeys: full ? undefined : [...new Set([...(left.targetKeys ?? []), ...(right.targetKeys ?? [])])],
+		ruleIds: combined(left.ruleIds, right.ruleIds),
+		sourceKinds: combined(left.sourceKinds, right.sourceKinds),
+	};
 }
 
-/** A bounded queue with one debounce timer, shared by all rules and sources. */
+/** One pending/queued background job per project, with independent debounce timers. */
 export class ScanScheduler implements vscode.Disposable {
 	private readonly queue: Job[] = [];
 	private readonly running = new Set<Job>();
 	private readonly pending = new Map<string, Pending>();
 	private readonly changed = new vscode.EventEmitter<ScanResult>();
-	private readonly registry: RuleRegistry;
-	private timer: NodeJS.Timeout | undefined;
 	private sequence = 0;
 	private disposed = false;
-
 	readonly onDidChangeScanState = this.changed.event;
 
-	constructor(private readonly planner: ScanPlanner, registry: RuleRegistry) {
-		this.registry = registry;
+	constructor(
+		private readonly planner: ScanPlanner,
+		private readonly registry: RuleRegistry,
+		private readonly store: IssueStore
+	) {}
+	private shortResult(scope: ScanScope, status: ScanResult['status'], runId?: string): ScanResult {
+		return { requested: scope, runId: runId ?? 'code-style-' + (++this.sequence),
+			projectKey: projectKeyOf(scope.projectRoot), actualTargets: [], pairs: [],
+			complete: status === 'noApplicableRules', status, issues: 0, errors: [] };
 	}
-	private noRules(scope: ScanScope, status: ScanResult['status']): ScanResult {
-		return { requested: scope, runId: `code-style-${++this.sequence}`, projectKey: projectKeyOf(scope.projectRoot),
-			actualTargets: [], pairs: [], complete: status === 'noApplicableRules', status, issues: 0, errors: [] };
+	private publish(result: ScanResult): void {
+		if (this.disposed) { return; }
+		this.store.recordScan(result);
+		try { this.changed.fire(result); }
+		catch (error) { log.warn('Подписчик сканирования: ' + String(error)); }
 	}
-	run(scope: ScanScope): Promise<ScanResult> {
-		if (this.disposed) { return Promise.resolve(this.noRules(scope, 'cancelled')); }
-		if (this.registry.list().length === 0) { return Promise.resolve(this.noRules(scope, 'noApplicableRules')); }
-		return new Promise<ScanResult>((resolve) => {
-			const sequence = ++this.sequence;
-			this.queue.push({ scope, sequence, runId: `code-style-${sequence}`,
-				source: new vscode.CancellationTokenSource(), resolve });
-			this.pump();
-		});
+	run(scope: ScanScope): Promise<ScanResult> { return this.enqueue(scope, false); }
+	private enqueue(scope: ScanScope, background: boolean): Promise<ScanResult> {
+		if (this.disposed) { return Promise.resolve(this.shortResult(scope, 'cancelled')); }
+		if (this.registry.list().length === 0) {
+			const empty = this.shortResult(scope, 'noApplicableRules');
+			this.publish(empty);
+			return Promise.resolve(empty);
+		}
+		// Coalesce repeated background scopes even after an earlier debounce flush.
+		if (background) {
+			const waiting = this.queue.find((job) => job.background && !job.source.token.isCancellationRequested &&
+				projectKeyOf(job.scope.projectRoot) === projectKeyOf(scope.projectRoot));
+			if (waiting) {
+				waiting.scope = mergeScopes(waiting.scope, scope);
+				return waiting.completion;
+			}
+		}
+		if (!background && this.queue.filter((job) => !job.background).length >= 16) {
+			const busy = { ...this.shortResult(scope, 'error'),
+				errors: [{ code: 'scanQueueFull', message: 'Очередь явных проверок переполнена.' }] };
+			this.publish(busy);
+			return Promise.resolve(busy);
+		}
+		let settle!: (result: ScanResult) => void;
+		const completion = new Promise<ScanResult>((resolve) => { settle = resolve; });
+		const sequence = ++this.sequence;
+		this.queue.push({ scope, sequence, runId: 'code-style-' + sequence, background,
+			source: new vscode.CancellationTokenSource(), resolve: settle, completion });
+		this.pump();
+		return completion;
 	}
 	private concurrency(): number {
 		const root = this.queue[0]?.scope.projectRoot ?? this.running.values().next().value?.scope.projectRoot;
@@ -60,16 +102,17 @@ export class ScanScheduler implements vscode.Disposable {
 	}
 	private pump(): void {
 		if (this.disposed) { return; }
-		while (this.running.size < this.concurrency() && this.queue.length > 0) {
+		while (this.queue.length > 0 && this.running.size < this.concurrency()) {
 			const job = this.queue.shift()!;
 			this.running.add(job);
 			void this.planner.scan(job.scope, job.runId, job.sequence, job.source.token)
 				.catch((error: unknown): ScanResult => {
-					log.error(`Планирование: ${error instanceof Error ? error.stack ?? error.message : error}`);
-					return { ...this.noRules(job.scope, 'error'), runId: job.runId, errors: [{ code: 'scanFailed', message: String(error) }] };
+					log.error('Планирование: ' + (error instanceof Error ? error.stack ?? error.message : error));
+					return { ...this.shortResult(job.scope, 'error', job.runId),
+						errors: [{ code: 'scanFailed', message: String(error) }] };
 				})
 				.then((result) => {
-					if (!this.disposed) { this.changed.fire(result); }
+					this.publish(result);
 					job.resolve(result);
 				})
 				.finally(() => {
@@ -79,44 +122,37 @@ export class ScanScheduler implements vscode.Disposable {
 				});
 		}
 	}
-
-	/** Save/external-change events are coalesced by project, not by rule. */
-	schedule(root: string, uri?: string, ruleIds?: readonly string[]): void {
+	private scheduleScope(scope: ScanScope): void {
 		if (this.disposed || this.registry.list().length === 0) { return; }
-		const key = projectKeyOf(root);
-		let pending = this.pending.get(key);
-		if (!pending) {
-			pending = { root, mode: uri ? 'partial' : 'full', files: new Set<string>(),
-				ruleIds: ruleIds ? new Set(ruleIds) : undefined };
-			this.pending.set(key, pending);
+		const key = projectKeyOf(scope.projectRoot);
+		const pending = this.pending.get(key);
+		if (pending) {
+			pending.scope = mergeScopes(pending.scope, scope);
+			if (pending.timer) { clearTimeout(pending.timer); }
 		}
-		if (!ruleIds) { pending.ruleIds = undefined; }
-		else if (pending.ruleIds) { for (const rule of ruleIds) { pending.ruleIds.add(rule); } }
-		if (!uri) { pending.mode = 'full'; pending.files.clear(); }
-		else if (pending.mode === 'partial') { pending.files.add(uri); }
-		if (this.timer) { clearTimeout(this.timer); }
-		this.timer = setTimeout(() => this.flush(), 300);
+		const entry = pending ?? { root: scope.projectRoot, scope };
+		entry.timer = setTimeout(() => {
+			this.pending.delete(key);
+			void this.enqueue(entry.scope, true);
+		}, 300);
+		this.pending.set(key, entry);
 	}
-	private flush(): void {
-		this.timer = undefined;
-		const items = [...this.pending.values()];
-		this.pending.clear();
-		for (const item of items) {
-			void this.run({ projectRoot: item.root, mode: item.mode,
-				files: item.mode === 'partial' ? [...item.files] : undefined,
-				ruleIds: item.ruleIds ? [...item.ruleIds] : undefined });
-		}
+	schedule(root: string, uri?: string, ruleIds?: readonly string[], sourceKinds?: readonly SourceKind[]): void {
+		this.scheduleScope({ projectRoot: root, mode: uri ? 'partial' : 'full',
+			files: uri ? [uri] : undefined, ruleIds, sourceKinds });
 	}
-	/** Do not cancel a full scan of other independent files; Store rejects its obsolete pair. */
+	scheduleTargets(root: string, keys: readonly string[], ruleIds?: readonly string[]): void {
+		if (keys.length === 0) { return; }
+		this.scheduleScope({ projectRoot: root, mode: 'partial', targetKeys: keys, ruleIds });
+	}
 	cancelForFile(uri: string): void {
-		for (const job of this.running) {
-			if (job.scope.mode === 'partial' && job.scope.files?.includes(uri)) { job.source.cancel(); }
-		}
-		for (const job of this.queue) {
+		for (const job of [...this.queue, ...this.running]) {
 			if (job.scope.mode === 'partial' && job.scope.files?.includes(uri)) { job.source.cancel(); }
 		}
 	}
 	cancelProject(projectKey: string): void {
+		const pending = this.pending.get(projectKey);
+		if (pending?.timer) { clearTimeout(pending.timer); }
 		this.pending.delete(projectKey);
 		for (const job of [...this.queue, ...this.running]) {
 			if (projectKeyOf(job.scope.projectRoot) === projectKey) { job.source.cancel(); }
@@ -125,11 +161,13 @@ export class ScanScheduler implements vscode.Disposable {
 	dispose(): void {
 		if (this.disposed) { return; }
 		this.disposed = true;
-		if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+		for (const pending of this.pending.values()) {
+			if (pending.timer) { clearTimeout(pending.timer); }
+		}
 		this.pending.clear();
 		for (const job of this.queue) {
 			job.source.cancel();
-			job.resolve(this.noRules(job.scope, 'cancelled'));
+			job.resolve(this.shortResult(job.scope, 'cancelled', job.runId));
 			job.source.dispose();
 		}
 		this.queue.length = 0;
