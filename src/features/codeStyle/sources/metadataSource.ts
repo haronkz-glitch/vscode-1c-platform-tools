@@ -79,6 +79,7 @@ export class MetadataSourceProvider implements SourceProvider {
 		if (token.isCancellationRequested) {
 			return { targets: [], revision: '', complete: false, errors: [{ code: 'cancelled', message: 'Отменено.', projectKey: project.key }] };
 		}
+		const treeRoots = new Set<string>();
 		const push = async (descriptor: TargetDescriptor): Promise<void> => {
 			const byFile = selection.files?.some((uri) => filePath(uri) !== undefined &&
 				sameFile(filePath(uri)!, filePath(descriptor.uri) ?? '')) ?? false;
@@ -102,6 +103,12 @@ export class MetadataSourceProvider implements SourceProvider {
 			if (treeSource.schemaSupported === false) {
 				complete = false;
 				errors.push({ code: 'metadataSchemaUnsupported', message: `Не поддерживается схема: ${treeSource.label}`, projectKey: project.key });
+				// Unsupported is distinct from an absent source; do not synthesize a readable root.
+				if (treeSource.configurationXmlRelativePath) {
+					const unsupportedFile = path.resolve(project.root, treeSource.configurationXmlRelativePath);
+					const matching = sourceByEntry(project, unsupportedFile);
+					if (matching) { treeRoots.add(matching.key); }
+				}
 				continue;
 			}
 			let configFile: string | undefined;
@@ -112,6 +119,7 @@ export class MetadataSourceProvider implements SourceProvider {
 					rootSource = sourceByEntry(project, configFile) ?? sourceForFile(project, configFile);
 				}
 				if (configFile && rootSource && (rootSource.kind === 'configuration' || rootSource.kind === 'extension')) {
+					treeRoots.add(rootSource.key);
 					await push({
 						projectKey: project.key, sourceKey: rootSource.key,
 						targetKey: targetKeyOf(rootSource, this.kind, configFile),
@@ -150,7 +158,7 @@ export class MetadataSourceProvider implements SourceProvider {
 		// Never silently omit a recognized configuration/extension from the inventory.
 		for (const root of expectedRoots) {
 			const targetKey = targetKeyOf(root, this.kind, root.entry);
-			if (targets.some((target) => target.targetKey === targetKey)) { continue; }
+			if (treeRoots.has(root.key)) { continue; }
 			complete = false;
 			errors.push({ code: 'metadataRootNotEnumerated', projectKey: project.key,
 				message: 'Дерево не содержит источник: ' + root.entry });

@@ -121,8 +121,9 @@ export class CodeStyleEvents implements vscode.Disposable {
 							watcher.onDidCreate((uri) => { void this.changedFile(uri, false, true); }),
 							watcher.onDidDelete((uri) => { void this.deletedFile(uri); }));
 					};
-					if (enabled.kinds.has('bsl')) { mkWatcher('**/*.bsl'); }
-					if (enabled.kinds.has('metadata')) { mkWatcher('**/*.{xml,mdo}'); }
+					// Dependencies may cross SourceKind: metadata rules can read BSL, and vice versa.
+					mkWatcher('**/*.bsl');
+					mkWatcher('**/*.{xml,mdo}');
 				}
 			}
 			if (this.disposed || serial !== this.serial) {
