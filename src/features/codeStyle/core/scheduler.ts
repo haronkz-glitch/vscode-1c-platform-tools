@@ -178,8 +178,10 @@ export class ScanScheduler implements vscode.Disposable {
 		}
 	}
 	cancelForFile(uri: string): void {
+		// Mixed scopes must keep independent work; IssueStore invalidates only affected pairs.
 		const matches = (job: Job): boolean => job.scope.mode === 'partial' &&
-			(job.scope.files?.includes(uri) ?? false);
+			job.scope.files?.length === 1 && job.scope.files[0] === uri &&
+			!job.scope.targetKeys?.length && !job.scope.pairs?.length;
 		this.cancelQueued(matches);
 		for (const job of this.running) { if (matches(job)) { job.source.cancel(); } }
 		this.pump();

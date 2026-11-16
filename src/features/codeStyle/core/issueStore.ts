@@ -436,9 +436,10 @@ export class IssueStore implements vscode.Disposable {
 				full.set(scan.projectKey, scan);
 			}
 		}
+		// Keep the latest attempt as well as the full inventory baseline.
 		const scans = recent.filter((scan) =>
-			scan === full.get(scan.projectKey) || (!full.has(scan.projectKey) &&
-				!recent.some((other) => other.projectKey === scan.projectKey && order(other) > order(scan)))
+			scan === full.get(scan.projectKey) ||
+				!recent.some((other) => other.projectKey === scan.projectKey && order(other) > order(scan))
 		).map((scan) => JSON.parse(JSON.stringify(scan)) as ScanResult);
 		const states = this.getPairStates(filter);
 		const errors: CodeStyleError[] = [...states.flatMap((state) => state.error ? [state.error] : [])];
@@ -481,7 +482,7 @@ export class IssueStore implements vscode.Disposable {
 				scan.pairs.filter((pair) => rules.some((rule) => rule.id === pair.ruleId))
 					.every((pair) => pair.status === 'completed' || pair.status === 'skipped');
 		};
-		const complete = projects.size > 0 && [...projects].every((projectKey) => {
+		const complete = errors.length === 0 && projects.size > 0 && [...projects].every((projectKey) => {
 			const matching = states.filter((state) => state.projectKey === projectKey);
 			if (matching.some((state) => state.status !== 'completed' || state.stale || state.error)) { return false; }
 			if (filter.targetKey || filter.uri) { return matching.length > 0; }
