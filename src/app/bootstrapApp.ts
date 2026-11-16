@@ -32,6 +32,7 @@ import { registerEdtFeature } from '../features/edt/registerEdtFeature';
 import { registerLaunchFeature } from '../features/launch/launchFeature';
 import { registerPlatformServerFeature } from '../features/launch/platformServerFeature';
 import { registerDiagnosticsFeature } from '../features/diagnostics/registerDiagnosticsFeature';
+import { registerCodeStyleFeature } from '../features/codeStyle/registerCodeStyleFeature';
 import { SourceTerminalLinkProvider } from '../features/tools/terminalLinks';
 import { registerTasksFeature } from '../features/tasks/registerTasksFeature';
 import { registerClustersFeature } from '../features/clusters/registerClustersFeature';
@@ -55,6 +56,7 @@ export async function bootstrapApp(context: vscode.ExtensionContext): Promise<Pl
 	// Раньше всего, что читает корень проекта или раскладку
 	registerProjectLayoutWatch(context);
 	context.subscriptions.push(initWorkspaceProjects(context));
+	context.subscriptions.push(registerCodeStyleFeature(context));
 
 	const { registerRuntime: registerProjectsRuntime } = registerProjectsFlow(context);
 

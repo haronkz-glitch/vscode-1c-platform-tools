@@ -77,6 +77,8 @@
   "activationEvents": [
     "workspaceContains:packagedef",
     "workspaceContains:**/packagedef",
+    "workspaceContains:**/Configuration.xml",
+    "workspaceContains:**/Configuration.mdo",
     "onCommand:1c-platform-tools.dependencies.initializePackagedef",
     "onCommand:1c-platform-tools.projects.create",
     "onView:1c-platform-tools-admin-clusters",
@@ -4683,6 +4685,105 @@
       }
     ],
     "configuration": [
+      {
+        "title": "Code Style",
+        "id": "1c-platform-tools.codeStyle",
+        "properties": {
+          "1c-platform-tools.codeStyle.enabled": {
+            "type": "boolean",
+            "default": true,
+            "scope": "resource",
+            "description": "Включить внутренний линтер Code Style."
+          },
+          "1c-platform-tools.codeStyle.scanOnSave": {
+            "type": "boolean",
+            "default": true,
+            "scope": "resource",
+            "description": "Автоматически проверять сохранённые и изменённые исходники."
+          },
+          "1c-platform-tools.codeStyle.maxConcurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8,
+            "default": 2,
+            "scope": "resource",
+            "description": "Количество одновременных проверок Code Style."
+          },
+          "1c-platform-tools.codeStyle.categories": {
+            "type": "object",
+            "default": {},
+            "scope": "resource",
+            "properties": {
+              "style": {
+                "type": "boolean",
+                "default": true,
+                "description": "Включить проверки категории style."
+              },
+              "metadata": {
+                "type": "boolean",
+                "default": true,
+                "description": "Включить проверки категории metadata."
+              },
+              "performance": {
+                "type": "boolean",
+                "default": true,
+                "description": "Включить проверки категории performance."
+              },
+              "security": {
+                "type": "boolean",
+                "default": true,
+                "description": "Включить проверки категории security."
+              },
+              "reliability": {
+                "type": "boolean",
+                "default": true,
+                "description": "Включить проверки категории reliability."
+              },
+              "compatibility": {
+                "type": "boolean",
+                "default": true,
+                "description": "Включить проверки категории compatibility."
+              }
+            },
+            "additionalProperties": false,
+            "description": "Включение и отключение категорий правил."
+          },
+          "1c-platform-tools.codeStyle.rules": {
+            "type": "object",
+            "default": {},
+            "scope": "resource",
+            "description": "Настройки правил по их идентификаторам (без отдельных ключей для каждого правила).",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "severity": {
+                  "type": "string",
+                  "enum": [
+                    "error",
+                    "warning",
+                    "information",
+                    "hint"
+                  ]
+                },
+                "options": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": [
+                      "string",
+                      "number",
+                      "boolean"
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      },
       {
         "title": "Инструменты",
         "id": "1c-platform-tools.tools",
