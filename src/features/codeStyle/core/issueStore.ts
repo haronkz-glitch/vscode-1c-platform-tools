@@ -115,9 +115,9 @@ export class IssueStore implements vscode.Disposable {
 		const affected = new Set<string>(), uris = new Set<string>(), rules = new Set<string>();
 		for (const [ruleId, revision] of Object.entries(revisions)) {
 			const key = configKey(projectKey, ruleId);
-			// Older runs can arrive after a configuration change: never roll revisions back.
-			if (this.revisionResolver && this.currentRevision(projectKey, ruleId) !== revision) { continue; }
 			const previous = this.settings.get(key);
+			// Older runs must not roll back the live configuration revision.
+			if (this.revisionResolver && this.currentRevision(projectKey, ruleId) !== revision) { continue; }
 			this.settings.set(key, revision);
 			if (previous === undefined || previous === revision) { continue; }
 			rules.add(ruleId);
@@ -337,7 +337,7 @@ export class IssueStore implements vscode.Disposable {
 				!input.ruleIds.includes(pair.ticket.ruleId) ||
 				!input.kinds.includes(pair.ticket.target.sourceKind) ||
 				(input.sourceKeys && !input.sourceKeys.includes(pair.ticket.target.sourceKey)) ||
-				input.applicablePairs.has(key) || pair.ticket.sequence > input.sequence) { continue; }
+				input.applicablePairs.has(key) || pair.lastSequence > input.sequence) { continue; }
 			this.reindex(key, pair);
 			this.pairs.delete(key);
 			rules.add(pair.ticket.ruleId);
@@ -411,12 +411,15 @@ export class IssueStore implements vscode.Disposable {
 			(!filter.severity || rule.severity === filter.severity);
 		const scoped = (scan: ScanResult): boolean => {
 			if (filter.projectKey && scan.projectKey !== filter.projectKey) { return false; }
-			// An inventory restricted to another source cannot cover the requested source.
-			if (filter.sourceKey && scan.requested.sourceKeys &&
-				!scan.requested.sourceKeys.includes(filter.sourceKey)) { return false; }
+			if (filter.sourceKey &&
+				(!scan.inventorySources?.includes(filter.sourceKey) ||
+					(scan.requested.sourceKeys && !scan.requested.sourceKeys.includes(filter.sourceKey)))) { return false; }
 			if (scan.status === 'noApplicableRules' && filter.ruleId) {
 				return scan.requested.ruleIds?.includes(filter.ruleId) === true;
 			}
+			// A full scan restricted to one source must never certify another source.
+			if (scan.requested.sourceKeys?.length &&
+				(!filter.sourceKey || !scan.requested.sourceKeys.includes(filter.sourceKey))) { return false; }
 			if (filter.ruleId || filter.area || filter.category || filter.severity) {
 				return scan.selectedRules?.some(ruleMatches) === true;
 			}
@@ -426,7 +429,10 @@ export class IssueStore implements vscode.Disposable {
 		const recent = [...this.scans.values()].filter(scoped).sort((a, b) => order(b) - order(a));
 		const full = new Map<string, ScanResult>();
 		for (const scan of recent) {
-			if (scan.requested.mode === 'full' && !full.has(scan.projectKey)) {
+			if (scan.requested.mode === 'full' && !full.has(scan.projectKey) &&
+				(!scan.requested.ruleIds?.length || Boolean(filter.ruleId &&
+					scan.requested.ruleIds.includes(filter.ruleId))) &&
+				(!scan.requested.sourceKinds?.length || Boolean(filter.sourceKey || filter.ruleId))) {
 				full.set(scan.projectKey, scan);
 			}
 		}
@@ -441,6 +447,7 @@ export class IssueStore implements vscode.Disposable {
 			const ruleIds = new Set(rules.map((rule) => rule.id));
 			const kinds = new Set(rules.flatMap((rule) => rule.sourceKinds));
 			return scan.errors.filter((error) => {
+				if (filter.sourceKey && error.sourceKey && error.sourceKey !== filter.sourceKey) { return false; }
 				if (filter.targetKey && error.targetKey && error.targetKey !== filter.targetKey) { return false; }
 				if (filter.ruleId && error.ruleId && error.ruleId !== filter.ruleId) { return false; }
 				if (error.ruleId && !ruleIds.has(error.ruleId)) { return false; }
@@ -453,19 +460,21 @@ export class IssueStore implements vscode.Disposable {
 		const projects = new Set([...scans.map((scan) => scan.projectKey), ...states.map((state) => state.projectKey)]);
 		const narrow = Boolean(filter.ruleId || filter.area || filter.category || filter.severity);
 		const scopeComplete = (scan: ScanResult): boolean => {
+			const relevant = (scan.selectedRules ?? []).filter(ruleMatches);
+			if (relevant.some((rule) =>
+				this.settings.get(configKey(scan.projectKey, rule.id)) !== scan.ruleRevisions?.[rule.id] ||
+				(this.revisionResolver !== undefined &&
+					this.currentRevision(scan.projectKey, rule.id) !== scan.ruleRevisions?.[rule.id]))) { return false; }
 			if (scan.status === 'noApplicableRules') { return scan.complete && !narrow; }
-			if (scan.inventoryCurrent === false || scan.requested.mode !== 'full' ||
-				(scan.inventoryEpoch !== undefined &&
-					this.inventoryRevision(scan.projectKey) !== scan.inventoryEpoch)) { return false; }
-			// A per-source or per-rule full run cannot attest the whole project.
-			if (!filter.sourceKey && scan.requested.sourceKeys?.length) { return false; }
-			if (filter.sourceKey && scan.requested.sourceKeys &&
-				!scan.requested.sourceKeys.includes(filter.sourceKey)) { return false; }
-			if (!narrow && scan.requested.ruleIds?.length) { return false; }
+			if (scan.inventoryCurrent !== true || scan.requested.mode !== 'full' ||
+				(scan.inventoryEpoch !== undefined && this.inventoryRevision(scan.projectKey) !== scan.inventoryEpoch) ||
+				(scan.requested.sourceKeys?.length && (!filter.sourceKey ||
+					!scan.requested.sourceKeys.includes(filter.sourceKey)))) { return false; }
+			// A scan of A cannot certify that all other rules/categories were checked.
+			if (scan.requested.ruleIds?.length && !filter.ruleId) { return false; }
+			if (scan.requested.sourceKinds?.length && !filter.ruleId) { return false; }
 			if (!narrow) { return scan.complete; }
 			const rules = (scan.selectedRules ?? []).filter(ruleMatches);
-			if (filter.ruleId && scan.requested.ruleIds?.length &&
-				!scan.requested.ruleIds.includes(filter.ruleId)) { return false; }
 			const kinds = new Set(rules.flatMap((rule) => rule.sourceKinds));
 			return rules.length > 0 && [...kinds].every((kind) => scan.sourceCompleteness?.[kind] === true) &&
 				scanErrors(scan).length === 0 &&

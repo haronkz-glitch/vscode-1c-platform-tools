@@ -35,7 +35,7 @@ function validError(error: unknown): boolean {
 		!(typeof (error as { message?: unknown }).message === 'string')) { return false; }
 	const record = error as Record<string, unknown>;
 	return Object.entries(record).every(([key, value]) =>
-		['code', 'message', 'projectKey', 'ruleId', 'targetKey', 'sourceKind'].includes(key) &&
+		['code', 'message', 'projectKey', 'sourceKey', 'ruleId', 'targetKey', 'sourceKind'].includes(key) &&
 		typeof value === 'string'
 	);
 }

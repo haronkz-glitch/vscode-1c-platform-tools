@@ -106,10 +106,19 @@ export class MetadataSourceProvider implements SourceProvider {
 			const sourceFile = treeSource.configurationXmlRelativePath
 				? path.resolve(project.root, treeSource.configurationXmlRelativePath) : undefined;
 			const declaredSource = sourceFile ? sourceByEntry(project, sourceFile) : undefined;
-			if (selection.sourceKeys && declaredSource && !selection.sourceKeys.includes(declaredSource.key)) { continue; }
+			if (selection.sourceKeys) {
+				const relevant = declaredSource
+					? selection.sourceKeys.includes(declaredSource.key)
+					: itemsOf(treeSource).some((item) => {
+						const source = sourceForFile(project, path.resolve(project.root, item.relativePath));
+						return source !== undefined && selection.sourceKeys!.includes(source.key);
+					});
+				if (!relevant) { continue; }
+			}
 			if (treeSource.schemaSupported === false) {
 				complete = false;
-				errors.push({ code: 'metadataSchemaUnsupported', message: `Не поддерживается схема: ${treeSource.label}`, projectKey: project.key });
+				errors.push({ code: 'metadataSchemaUnsupported', message: `Не поддерживается схема: ${treeSource.label}`,
+					projectKey: project.key, sourceKey: declaredSource?.key });
 				// Unsupported is distinct from an absent source; do not synthesize a readable root.
 				if (treeSource.configurationXmlRelativePath) {
 					const unsupportedFile = path.resolve(project.root, treeSource.configurationXmlRelativePath);
@@ -122,6 +131,12 @@ export class MetadataSourceProvider implements SourceProvider {
 			let rootSource: SourceRef | undefined;
 			const metadataRoot = treeSource.metadataRootRelativePath
 				? path.resolve(project.root, treeSource.metadataRootRelativePath) : undefined;
+			if (metadataRoot && !sameOrUnder(metadataRoot, project.root)) {
+				complete = false;
+				errors.push({ code: 'metadataRootOutsideProject', projectKey: project.key,
+					message: 'metadataRootRelativePath выходит за проект: ' + treeSource.label });
+				continue;
+			}
 			try {
 				if (treeSource.configurationXmlRelativePath) {
 					configFile = safePath(project, treeSource.configurationXmlRelativePath);

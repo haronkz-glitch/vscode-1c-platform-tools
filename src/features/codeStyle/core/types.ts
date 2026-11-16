@@ -14,6 +14,7 @@ export interface CodeStyleError {
 	readonly code: string;
 	readonly message: string;
 	readonly projectKey?: string;
+	readonly sourceKey?: string;
 	readonly targetKey?: string;
 	readonly ruleId?: string;
 	readonly sourceKind?: SourceKind;
@@ -190,11 +191,14 @@ export interface ScanResult {
 	readonly projectKey: string;
 	readonly requested: ScanScope;
 	readonly selectedRules?: readonly RuleSummary[];
+	readonly ruleRevisions?: Readonly<Record<string, string>>;
 	/** Per-kind inventory completeness for filtered result summaries. */
 	readonly sourceCompleteness?: Partial<Record<SourceKind, boolean>>;
 	readonly inventoryCurrent?: boolean;
 	/** Store inventory generation captured for this run. */
 	readonly inventoryEpoch?: number;
+	/** Source roots confirmed for this inventory. */
+	readonly inventorySources?: readonly string[];
 	readonly actualTargets: readonly string[];
 	readonly pairs: readonly PairResult[];
 	readonly inventoryRevision?: string;

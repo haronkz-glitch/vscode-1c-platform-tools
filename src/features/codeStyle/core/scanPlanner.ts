@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { logger } from '../../../shared/logger';
 import { canonicalFileUri, compareText, projectKeyOf, targetCompare } from './identity';
-import { filePath, projectByExplicitRoot } from '../sources/projectSource';
+import { filePath, projectByExplicitRoot, sourceRoots } from '../sources/projectSource';
 import { SourceRegistry } from '../sources/sourceRegistry';
 import { RuleRegistry } from './ruleRegistry';
 import { SettingsProvider } from './settings';
@@ -79,9 +79,11 @@ export class ScanPlanner {
 		this.store.setRuleRevisions(key, Object.fromEntries(
 			Object.entries(effective.rules).map(([id, value]) => [id, value.revision])
 		));
-		const requestedIds = scope.ruleIds?.length || scope.pairs?.length
-			? [...new Set([...(scope.ruleIds ?? []), ...(scope.pairs ?? []).map((pair) => pair.ruleId)])]
-			: undefined;
+		const pairsOnly = scope.mode === 'partial' && (scope.pairs?.length ?? 0) > 0 &&
+			!scope.files?.length && !scope.targetKeys?.length;
+		const requestedIds = scope.ruleIds
+			? [...new Set([...scope.ruleIds, ...(scope.pairs ?? []).map((pair) => pair.ruleId)])]
+			: pairsOnly ? [...new Set((scope.pairs ?? []).map((pair) => pair.ruleId))] : undefined;
 		const selected = this.rules.select(effective, { ruleIds: requestedIds, kinds: scope.sourceKinds });
 		if (selected.length === 0) { return result(scope, runId, key, 'noApplicableRules'); }
 
@@ -100,18 +102,30 @@ export class ScanPlanner {
 			}]);
 		}
 		const project = resolvedProject;
+		if (scope.sourceKeys?.length) {
+			const known = new Set(sourceRoots(project).map((root) => root.key));
+			const missingSources = scope.sourceKeys.filter((sourceKey) => !known.has(sourceKey));
+			if (missingSources.length) {
+				return result(scope, runId, key, 'unsupported', missingSources.map((sourceKey) => ({
+					code: 'unknownSource', sourceKey, projectKey: key,
+					message: 'В проекте отсутствует запрошенный источник: ' + sourceKey,
+				})));
+			}
+		}
 		const selectedRules = selected.map((rule) => ({
 			id: rule.id, area: rule.area, category: rule.category,
 			severity: effective.rules[rule.id].severity, sourceKinds: [...rule.sourceKinds],
 		}));
+		const ruleRevisions = Object.fromEntries(selected.map((rule) => [
+			rule.id, effective.rules[rule.id].revision,
+		]));
 		const kinds = [...new Set(selected.flatMap((rule) => rule.sourceKinds)
 			.filter((kind) => !scope.sourceKinds || scope.sourceKinds.includes(kind))
 			.filter((kind) => {
 				if (scope.mode !== 'partial' || scope.targetKeys?.length || scope.sourceKeys?.length) { return true; }
-				if (scope.pairs?.length && !scope.files?.length) {
-					return scope.pairs.some((pair) => pair.targetKey.includes('|' + kind + '|'));
-				}
-				if (!scope.files?.length) { return true; }
+				// Explicit dependent pairs retain their own SourceKind even when merged with a file event.
+				if (scope.pairs?.some((pair) => pair.targetKey.includes('|' + kind + '|'))) { return true; }
+				if (!scope.files?.length) { return !scope.pairs?.length; }
 				if (kind === 'bsl') { return scope.files.some((uri) => filePath(uri)?.toLowerCase().endsWith('.bsl')); }
 				if (kind === 'metadata') { return scope.files.some((uri) => /\.(xml|mdo)$/i.test(filePath(uri) ?? '')); }
 				return true;
@@ -122,6 +136,9 @@ export class ScanPlanner {
 				explicit ? [{ code: 'unsupportedSource', message: 'Нет поставщика для выбранной цели.', projectKey: key }] : []),
 				selectedRules };
 		}
+		const inventorySources = sourceRoots(project)
+			.filter((source) => !scope.sourceKeys || scope.sourceKeys.includes(source.key))
+			.map((source) => source.key);
 		const inventoryEpoch = this.store.inventoryRevision(key);
 		const projectEpoch = this.store.projectGeneration(key);
 		const inventories = new Map<SourceKind, SourceInventory>();
@@ -260,8 +277,8 @@ export class ScanPlanner {
 		else if (checkedTargets.size > 0) { status = 'partial'; }
 		else if (pairs.some((pair) => pair.status === 'stale')) { status = 'stale'; }
 		else { status = 'error'; }
-		return { runId, projectKey: key, requested: scope, selectedRules, sourceCompleteness,
-			inventoryCurrent, inventoryEpoch, actualTargets: [...checkedTargets].sort(compareText), pairs,
+		return { runId, projectKey: key, requested: scope, selectedRules, ruleRevisions, sourceCompleteness,
+			inventoryCurrent, inventoryEpoch, inventorySources, actualTargets: [...checkedTargets].sort(compareText), pairs,
 			inventoryRevision, complete: finished, status, issues: acceptedCount, errors };
 	}
 }

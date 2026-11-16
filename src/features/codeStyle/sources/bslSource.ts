@@ -37,7 +37,11 @@ export class BslSourceProvider implements SourceProvider {
 		const errors: CodeStyleError[] = [];
 		const visited = new Set<string>();
 		const names = excludedDirectories(project);
-		const roots = sourceRoots(project).filter((root) => !selection.sourceKeys || selection.sourceKeys.includes(root.key));
+		const ownedRoots = [...sourceRoots(project)].sort((a, b) => b.root.length - a.root.length);
+		const roots = ownedRoots.filter((root) => !selection.sourceKeys || selection.sourceKeys.includes(root.key));
+		const ownerOf = (file: string): (typeof ownedRoots)[number] | undefined =>
+			project.excludedRoots.some((root) => sameOrUnder(file, root)) ? undefined :
+				ownedRoots.find((root) => sameOrUnder(file, root.root));
 		let complete = true;
 		const error = (code: string, file: string, problem: unknown): void => {
 			complete = false;
@@ -45,7 +49,7 @@ export class BslSourceProvider implements SourceProvider {
 		};
 		const add = async (file: string, known?: TrustedRoots): Promise<void> => {
 			if (!/\.bsl$/i.test(file)) { return; }
-			const source = sourceForFile(project, file);
+			const source = ownerOf(file);
 			if (!source || !roots.some((root) => root.key === source.key) || excluded(project, path.dirname(file), names)) {
 				return;
 			}
@@ -120,7 +124,7 @@ export class BslSourceProvider implements SourceProvider {
 						if (isDir) {
 							if (!excluded(project, file, names) &&
 								!project.excludedRoots.some((root) => sameOrUnder(file, root)) &&
-								sourceForFile(project, file)?.key === source.key) { await walk(file); }
+								ownerOf(file)?.key === source.key) { await walk(file); }
 						} else if (isFile && /\.bsl$/i.test(file)) {
 							await add(file, trusted);
 						}
