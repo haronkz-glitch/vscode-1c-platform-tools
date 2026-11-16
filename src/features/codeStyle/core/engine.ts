@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { logger } from '../../../shared/logger';
-import { compareText, issueLocationValid, stableIssueId } from './identity';
+import { canonicalFileUri, compareText, issueLocationValid, stableIssueId } from './identity';
 import { persistedVersion, readPersisted, SourceDataError, sourceError } from './sourceVersion';
 import type {
 	CodeStyleError, DependencySnapshot, EffectiveRuleSettings, Issue, ProjectRef, RuleDefinition,
@@ -63,7 +63,10 @@ export class CodeStyleEngine {
 		try { sourceVersion = await persistedVersion(target.uri); }
 		catch (error) {
 			const resolved = sourceError(error);
-			for (const rule of selected) { results.push(failure(rule, 'error', resolved.code, resolved)); }
+			const status: PairStatus = resolved.code === 'dirtySource' || resolved.code === 'staleSource' ? 'stale'
+				: resolved.code === 'unsupportedSource' ? 'unsupported'
+					: resolved.code === 'cancelled' ? 'cancelled' : 'error';
+			for (const rule of selected) { results.push(failure(rule, status, resolved.code, resolved)); }
 			return { pairs: results, sourceVersion: '' };
 		}
 		let detailed: Promise<TargetSnapshot> | undefined;
@@ -81,14 +84,15 @@ export class CodeStyleEngine {
 			return detailed;
 		};
 		const related = new Map<string, Promise<DependencySnapshot>>();
-		const readRelated = (uri: string): Promise<DependencySnapshot> => {
+		const readRelated = (requestedUri: string): Promise<DependencySnapshot> => {
+			const uri = canonicalFileUri(requestedUri);
 			if (!related.has(uri)) {
 				related.set(uri, (async () => {
 					if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
 					await ensureOwnedUri(project, uri);
 					const snapshot = await readPersisted(uri);
 					if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
-					return { uri, version: snapshot.version, text: snapshot.bytes.toString('utf8') };
+					return { uri, version: snapshot.version, text: snapshot.text };
 				})().catch((error: unknown) => { throw sourceError(error); }));
 			}
 			return related.get(uri)!;
@@ -100,7 +104,10 @@ export class CodeStyleEngine {
 				continue;
 			}
 			const used = new Map<string, number>();
-			const capture = (uri: string): void => { if (!used.has(uri)) { used.set(uri, generationOf(uri)); } };
+			const capture = (requestedUri: string): void => {
+				const uri = canonicalFileUri(requestedUri);
+				if (!used.has(uri)) { used.set(uri, generationOf(uri)); }
+			};
 			let usedDetail = false;
 			try {
 				// The configuration schema/support is an implicit dependency of metadata objects.
@@ -125,9 +132,15 @@ export class CodeStyleEngine {
 					}
 					if (issue.location.uri !== target.uri) { capture(issue.location.uri); }
 				}
-				const dependencies = await Promise.all([...used].sort(([left], [right]) => compareText(left, right)).map(async ([uri, generation]) => ({
-					uri, generation, version: (await readRelated(uri)).version,
-				})));
+				const dependencies = await Promise.all([...used]
+					.sort(([left], [right]) => compareText(left, right))
+					.map(async ([uri, generation]) => {
+						// Only read text when a rule requested it. Implicit schema/related-location
+						// dependencies need a cheap version, not a full TextDocument load.
+						const cached = related.get(uri);
+						if (!cached) { await ensureOwnedUri(project, uri); }
+						return { uri, generation, version: cached ? (await cached).version : await persistedVersion(uri) };
+					}));
 				if (detailedFailure && usedDetail) { throw detailedFailure; }
 				if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
 				results.push({ ruleId: rule.id, target, status: 'completed', issues, sourceVersion, dependencies });
@@ -158,7 +171,13 @@ export class CodeStyleEngine {
 			if (issue.fix !== undefined && !rule.fix) {
 				throw new Error('Правило предложило исправление без контракта fix.');
 			}
-			validated.push(issue);
+			validated.push({
+				...issue,
+				location: { ...issue.location, uri: canonicalFileUri(issue.location.uri) },
+				relatedLocations: issue.relatedLocations?.map((related) => ({
+					...related, uri: canonicalFileUri(related.uri),
+				})),
+			});
 		}
 		validated.sort((a, b) =>
 			compareText(a.location.uri, b.location.uri) ||

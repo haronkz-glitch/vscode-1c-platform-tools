@@ -1,10 +1,10 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { externalEntry } from '../../../shared/projectLayout';
+import { externalEntry, sameOrUnder } from '../../../shared/projectLayout';
 import { loadProjectMetadataTree, type MetadataItemDto, type MetadataSourceDto, type ProjectMetadataTreeDto } from '../../metadata/metadataTreeService';
 import { ensureMdSparrowRuntime } from '../../metadata/mdSparrowBootstrap';
 import { runMdSparrowParamsRead, type MdSparrowParams } from '../../metadata/mdSparrowParams';
-import { metadataFileVersion } from '../../metadata/metadataFileChanges';
+import { persistedVersion } from '../core/sourceVersion';
 import { mdSparrowSchemaFlagFromConfigurationXml, designerXmlVersionToMdSparrowFlag } from '../../metadata/mdSparrowSchemaVersion';
 import { stableHash, targetCompare, targetKeyOf } from '../core/identity';
 import { SourceDataError } from '../core/sourceVersion';
@@ -54,9 +54,11 @@ export class MetadataSourceProvider implements SourceProvider {
 		let complete = true;
 		let tree: ProjectMetadataTreeDto;
 		const expectedRoots = sourceRoots(project).filter((root) =>
-			root.kind === 'configuration' || root.kind === 'extension'
+			(root.kind === 'configuration' || root.kind === 'extension') &&
+			(!selection.sourceKeys || selection.sourceKeys.includes(root.key))
 		);
-		const noConfigurations = expectedRoots.length === 0;
+		const noConfigurations = !sourceRoots(project).some((root) =>
+			root.kind === 'configuration' || root.kind === 'extension');
 		try {
 			// A project containing only external artifacts cannot provide a configuration tree.
 			tree = noConfigurations
@@ -81,6 +83,7 @@ export class MetadataSourceProvider implements SourceProvider {
 		}
 		const treeRoots = new Set<string>();
 		const push = async (descriptor: TargetDescriptor): Promise<void> => {
+			if (selection.sourceKeys && !selection.sourceKeys.includes(descriptor.sourceKey)) { return; }
 			const byFile = selection.files?.some((uri) => filePath(uri) !== undefined &&
 				sameFile(filePath(uri)!, filePath(descriptor.uri) ?? '')) ?? false;
 			const byKey = selection.targetKeys?.includes(descriptor.targetKey) ?? false;
@@ -100,6 +103,10 @@ export class MetadataSourceProvider implements SourceProvider {
 		};
 		for (const treeSource of tree.sources) {
 			if (token.isCancellationRequested) { complete = false; break; }
+			const sourceFile = treeSource.configurationXmlRelativePath
+				? path.resolve(project.root, treeSource.configurationXmlRelativePath) : undefined;
+			const declaredSource = sourceFile ? sourceByEntry(project, sourceFile) : undefined;
+			if (selection.sourceKeys && declaredSource && !selection.sourceKeys.includes(declaredSource.key)) { continue; }
 			if (treeSource.schemaSupported === false) {
 				complete = false;
 				errors.push({ code: 'metadataSchemaUnsupported', message: `Не поддерживается схема: ${treeSource.label}`, projectKey: project.key });
@@ -113,10 +120,15 @@ export class MetadataSourceProvider implements SourceProvider {
 			}
 			let configFile: string | undefined;
 			let rootSource: SourceRef | undefined;
+			const metadataRoot = treeSource.metadataRootRelativePath
+				? path.resolve(project.root, treeSource.metadataRootRelativePath) : undefined;
 			try {
 				if (treeSource.configurationXmlRelativePath) {
 					configFile = safePath(project, treeSource.configurationXmlRelativePath);
 					rootSource = sourceByEntry(project, configFile) ?? sourceForFile(project, configFile);
+					if (metadataRoot && rootSource && !sameOrUnder(metadataRoot, rootSource.root)) {
+						throw new Error('metadataRootRelativePath вне корня объявленного источника.');
+					}
 				}
 				if (configFile && rootSource && (rootSource.kind === 'configuration' || rootSource.kind === 'extension')) {
 					treeRoots.add(rootSource.key);
@@ -139,7 +151,10 @@ export class MetadataSourceProvider implements SourceProvider {
 				try {
 					const file = safePath(project, item.relativePath);
 					const source = sourceForFile(project, file);
-					if (!source) { throw new Error('Не найден корень metadata-объекта.'); }
+					if (!source || (rootSource && source.key !== rootSource.key) ||
+						(metadataRoot && !sameOrUnder(file, metadataRoot))) {
+						throw new Error('Metadata-объект находится вне metadataRootRelativePath или принадлежит другому источнику.');
+					}
 					await push({
 						projectKey: project.key, sourceKey: source.key,
 						targetKey: targetKeyOf(source, this.kind, file), sourceKind: this.kind,
@@ -184,7 +199,7 @@ export class MetadataSourceProvider implements SourceProvider {
 		if (!file || !source || source.key !== target.sourceKey) { throw new Error('metadata-цель больше не принадлежит источнику.'); }
 		await ensureSafeFile(project, file, source);
 		if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
-		const version = await metadataFileVersion(file);
+		const version = await persistedVersion(target.uri);
 		const config = target.metadata.configurationFile;
 		const isRoot = target.isSourceRoot === true;
 		const flagFile = source.kind === 'processor' || source.kind === 'report' ? file : (isRoot ? file : config);
@@ -198,7 +213,9 @@ export class MetadataSourceProvider implements SourceProvider {
 		const result = await runMdSparrowParamsRead(runtime, params, { cwd: project.root, token });
 		if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
 		if (result.exitCode !== 0) { throw new Error(result.stderr.trim() || result.stdout.trim() || 'md-sparrow завершился с ошибкой.'); }
-		if ((await metadataFileVersion(file)) !== version) { throw new Error('metadata-объект изменился во время чтения.'); }
+		if ((await persistedVersion(target.uri)) !== version) {
+			throw new SourceDataError('staleSource', 'metadata-объект изменился во время чтения.');
+		}
 		let dto: unknown;
 		try { dto = JSON.parse(result.stdout) as unknown; }
 		catch { throw new Error('md-sparrow вернул некорректный JSON.'); }

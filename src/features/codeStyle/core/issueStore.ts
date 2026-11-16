@@ -1,10 +1,10 @@
 import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
 import { sameOrUnder } from '../../../shared/projectLayout';
-import { compareText } from './identity';
+import { canonicalFileUri, compareText } from './identity';
 import { persistedVersion } from './sourceVersion';
 import type {
-	CodeStyleError, Issue, IssueFilter, IssueQueryResult, PairStatus, ScanResult, SourceKind, StoreChange,
+	CodeStyleError, Issue, IssueFilter, IssueQueryResult, PairStatus, RuleArea, RuleCategory, Severity, ScanResult, SourceKind, StoreChange,
 	TargetDescriptor,
 } from './types';
 
@@ -13,6 +13,9 @@ export interface CommitTicket {
 	readonly sequence: number;
 	readonly projectKey: string;
 	readonly ruleId: string;
+	readonly area: RuleArea;
+	readonly category: RuleCategory;
+	readonly severity: Severity;
 	readonly target: TargetDescriptor;
 	readonly settingsRevision: string;
 	readonly sourceVersion: string;
@@ -32,6 +35,10 @@ export interface PairState {
 	readonly projectKey: string;
 	readonly ruleId: string;
 	readonly targetKey: string;
+	readonly sourceKey: string;
+	readonly area: RuleArea;
+	readonly category: RuleCategory;
+	readonly severity: Severity;
 	readonly status: PairStatus;
 	readonly stale: boolean;
 	readonly error?: CodeStyleError;
@@ -69,18 +76,26 @@ export class IssueStore implements vscode.Disposable {
 	private readonly emitter = new vscode.EventEmitter<StoreChange>();
 	private readonly scans = new Map<string, ScanResult>();
 	private disposed = false;
+	private revisionResolver?: (projectKey: string, ruleId: string) => string | undefined;
 
 	readonly onDidChange = this.emitter.event;
-	fileGeneration(uri: string): number { return this.generation.get(uri) ?? 0; }
+	setRevisionResolver(resolve: (projectKey: string, ruleId: string) => string | undefined): void {
+		this.revisionResolver = resolve;
+	}
+	private currentRevision(projectKey: string, ruleId: string): string | undefined {
+		try { return this.revisionResolver?.(projectKey, ruleId); }
+		catch { return undefined; }
+	}
+	fileGeneration(uri: string): number { return this.generation.get(canonicalFileUri(uri)) ?? 0; }
 	projectGeneration(key: string): number { return this.projectEpoch.get(key) ?? 0; }
 	inventoryRevision(key: string): number { return this.inventoryEpoch.get(key) ?? 0; }
 	bumpInventory(key: string): void {
 		if (!this.disposed) { this.inventoryEpoch.set(key, this.inventoryRevision(key) + 1); }
 	}
 	knownSourceVersion(uri: string): string | undefined {
-		for (const id of this.byUri.get(uri) ?? []) {
+		for (const id of this.byUri.get(canonicalFileUri(uri)) ?? []) {
 			const pair = this.pairs.get(id);
-			if (pair && pair.status === 'completed' && !pair.stale && pair.ticket.target.uri === uri) {
+			if (pair && pair.status === 'completed' && !pair.stale && canonicalFileUri(pair.ticket.target.uri) === canonicalFileUri(uri)) {
 				return pair.ticket.sourceVersion;
 			}
 		}
@@ -100,6 +115,8 @@ export class IssueStore implements vscode.Disposable {
 		const affected = new Set<string>(), uris = new Set<string>(), rules = new Set<string>();
 		for (const [ruleId, revision] of Object.entries(revisions)) {
 			const key = configKey(projectKey, ruleId);
+			// Older runs can arrive after a configuration change: never roll revisions back.
+			if (this.revisionResolver && this.currentRevision(projectKey, ruleId) !== revision) { continue; }
 			const previous = this.settings.get(key);
 			this.settings.set(key, revision);
 			if (previous === undefined || previous === revision) { continue; }
@@ -118,6 +135,8 @@ export class IssueStore implements vscode.Disposable {
 	private isTicketCurrent(ticket: CommitTicket): boolean {
 		if (this.disposed || ticket.cancellation.isCancellationRequested ||
 			this.settings.get(configKey(ticket.projectKey, ticket.ruleId)) !== ticket.settingsRevision ||
+			(this.revisionResolver !== undefined &&
+				this.currentRevision(ticket.projectKey, ticket.ruleId) !== ticket.settingsRevision) ||
 			this.projectGeneration(ticket.projectKey) !== ticket.projectGeneration ||
 			this.fileGeneration(ticket.target.uri) !== ticket.sourceGeneration ||
 			ticket.dependencies.some((dep) => this.fileGeneration(dep.uri) !== dep.generation)) {
@@ -153,7 +172,8 @@ export class IssueStore implements vscode.Disposable {
 	}
 	private indexedUris(pair: StoredPair): Set<string> {
 		return new Set([pair.ticket.target.uri, ...pair.ticket.dependencies.map((dep) => dep.uri),
-			...pair.issues.flatMap((issue) => [issue.location.uri, ...(issue.relatedLocations ?? []).map((loc) => loc.uri)])]);
+			...pair.issues.flatMap((issue) => [issue.location.uri, ...(issue.relatedLocations ?? []).map((loc) => loc.uri)])
+		].map(canonicalFileUri));
 	}
 	private reindex(key: string, previous?: StoredPair, next?: StoredPair): void {
 		if (previous) {
@@ -219,6 +239,7 @@ export class IssueStore implements vscode.Disposable {
 	/** Return affected target/rule pairs so the coordinator can reschedule dependencies. */
 	invalidateUri(uri: string): readonly AffectedPair[] {
 		if (this.disposed) { return []; }
+		uri = canonicalFileUri(uri);
 		this.generation.set(uri, this.fileGeneration(uri) + 1);
 		const uris = new Set<string>(), projects = new Set<string>(), rules = new Set<string>();
 		const affected: AffectedPair[] = [];
@@ -227,7 +248,7 @@ export class IssueStore implements vscode.Disposable {
 			if (!pair) { continue; }
 			affected.push({
 				projectKey: pair.ticket.projectKey, ruleId: pair.ticket.ruleId,
-				targetKey: pair.ticket.target.targetKey, targetUri: pair.ticket.target.uri,
+				targetKey: pair.ticket.target.targetKey, targetUri: canonicalFileUri(pair.ticket.target.uri),
 				sourceKind: pair.ticket.target.sourceKind,
 			});
 			if (pair.stale) { continue; }
@@ -240,11 +261,12 @@ export class IssueStore implements vscode.Disposable {
 		return affected;
 	}
 	removeUri(uri: string): readonly AffectedPair[] {
+		uri = canonicalFileUri(uri);
 		const affected = this.invalidateUri(uri);
 		const uris = new Set<string>(), projects = new Set<string>(), rules = new Set<string>();
 		for (const key of [...(this.byUri.get(uri) ?? [])]) {
 			const pair = this.pairs.get(key);
-			if (!pair || pair.ticket.target.uri !== uri) { continue; }
+			if (!pair || canonicalFileUri(pair.ticket.target.uri) !== uri) { continue; }
 			for (const issue of pair.issues) { uris.add(issue.location.uri); }
 			projects.add(pair.ticket.projectKey);
 			rules.add(pair.ticket.ruleId);
@@ -252,8 +274,21 @@ export class IssueStore implements vscode.Disposable {
 			this.pairs.delete(key);
 		}
 		this.fire('remove', uris, projects, rules);
-		return affected.filter((pair) => pair.targetUri !== uri);
+		return affected.filter((pair) => canonicalFileUri(pair.targetUri) !== uri);
 	}
+	/** Confirmed directory removal: remove descendant targets and invalidate dependent pairs. */
+	removeDirectory(directoryUri: string): readonly AffectedPair[] {
+		const directory = vscode.Uri.parse(canonicalFileUri(directoryUri)).fsPath;
+		const affected = new Map<string, AffectedPair>();
+		for (const uri of [...this.byUri.keys()]) {
+			if (!sameOrUnder(vscode.Uri.parse(uri).fsPath, directory)) { continue; }
+			for (const pair of this.removeUri(uri)) {
+				affected.set(pairKey(pair.projectKey, pair.ruleId, pair.targetKey), pair);
+			}
+		}
+		return [...affected.values()];
+	}
+
 	invalidateProject(key: string, inventoryChanged = true): void {
 		if (this.disposed) { return; }
 		this.projectEpoch.set(key, this.projectGeneration(key) + 1);
@@ -291,6 +326,7 @@ export class IssueStore implements vscode.Disposable {
 		sequence: number;
 		ruleIds: readonly string[];
 		kinds: readonly SourceKind[];
+		sourceKeys?: readonly string[];
 		applicablePairs: ReadonlySet<string>;
 	}): boolean {
 		if (this.disposed || this.inventoryRevision(input.projectKey) !== input.inventoryGeneration ||
@@ -300,6 +336,7 @@ export class IssueStore implements vscode.Disposable {
 			if (pair.ticket.projectKey !== input.projectKey ||
 				!input.ruleIds.includes(pair.ticket.ruleId) ||
 				!input.kinds.includes(pair.ticket.target.sourceKind) ||
+				(input.sourceKeys && !input.sourceKeys.includes(pair.ticket.target.sourceKey)) ||
 				input.applicablePairs.has(key) || pair.ticket.sequence > input.sequence) { continue; }
 			this.reindex(key, pair);
 			this.pairs.delete(key);
@@ -325,10 +362,13 @@ export class IssueStore implements vscode.Disposable {
 			if (filter.status === 'stale' && !pair.stale) { continue; }
 			if (filter.projectKey && pair.ticket.projectKey !== filter.projectKey) { continue; }
 			if (filter.targetKey && pair.ticket.target.targetKey !== filter.targetKey) { continue; }
+			if (filter.area && pair.ticket.area !== filter.area) { continue; }
+			if (filter.category && pair.ticket.category !== filter.category) { continue; }
+			if (filter.severity && pair.ticket.severity !== filter.severity) { continue; }
 			if (filter.sourceKey && pair.ticket.target.sourceKey !== filter.sourceKey) { continue; }
 			if (filter.ruleId && pair.ticket.ruleId !== filter.ruleId) { continue; }
 			for (const issue of pair.issues) {
-				if ((filter.uri && issue.location.uri !== filter.uri) ||
+				if ((filter.uri && canonicalFileUri(issue.location.uri) !== canonicalFileUri(filter.uri)) ||
 					(filter.area && issue.area !== filter.area) ||
 					(filter.category && issue.category !== filter.category) ||
 					(filter.severity && issue.severity !== filter.severity)) { continue; }
@@ -348,49 +388,102 @@ export class IssueStore implements vscode.Disposable {
 			(!filter.sourceKey || filter.sourceKey === pair.ticket.target.sourceKey) &&
 			(!filter.targetKey || filter.targetKey === pair.ticket.target.targetKey) &&
 			(!filter.ruleId || filter.ruleId === pair.ticket.ruleId) &&
-			(!filter.uri || this.indexedUris(pair).has(filter.uri))
+			(!filter.status || filter.status === 'all' ||
+				(filter.status === 'stale' ? pair.stale : !pair.stale)) &&
+			(!filter.area || filter.area === pair.ticket.area) &&
+			(!filter.category || filter.category === pair.ticket.category) &&
+			(!filter.severity || filter.severity === pair.ticket.severity) &&
+			(!filter.uri || this.indexedUris(pair).has(canonicalFileUri(filter.uri)))
 		).map((pair) => ({
 			projectKey: pair.ticket.projectKey, ruleId: pair.ticket.ruleId,
-			targetKey: pair.ticket.target.targetKey, status: pair.status, stale: pair.stale,
+			targetKey: pair.ticket.target.targetKey, sourceKey: pair.ticket.target.sourceKey,
+			area: pair.ticket.area, category: pair.ticket.category, severity: pair.ticket.severity,
+			status: pair.status, stale: pair.stale,
 			error: pair.error ? { ...pair.error } : undefined,
 		})).sort((a, b) => compareText(a.projectKey, b.projectKey) ||
 			compareText(a.targetKey, b.targetKey) || compareText(a.ruleId, b.ruleId));
 	}
 	query(filter: IssueFilter = {}): IssueQueryResult {
-		// Keep the newest full scope separately from partial updates; partial success
-		// cannot erase outstanding failures from a prior full inventory.
-		const last = new Map<string, ScanResult>();
-		for (const scan of this.scans.values()) {
-			if (filter.projectKey && scan.projectKey !== filter.projectKey) { continue; }
-			const key = JSON.stringify([scan.projectKey, scan.requested.mode]);
-			const previous = last.get(key);
-			const order = (value: ScanResult) => Number(value.runId.split('-').at(-1)) || 0;
-			if (!previous || order(scan) >= order(previous)) { last.set(key, scan); }
-		}
-		const newest = (scan: ScanResult): number => Number(scan.runId.split('-').at(-1)) || 0;
+		const ruleMatches = (rule: NonNullable<ScanResult['selectedRules']>[number]): boolean =>
+			(!filter.ruleId || rule.id === filter.ruleId) &&
+			(!filter.area || rule.area === filter.area) &&
+			(!filter.category || rule.category === filter.category) &&
+			(!filter.severity || rule.severity === filter.severity);
+		const scoped = (scan: ScanResult): boolean => {
+			if (filter.projectKey && scan.projectKey !== filter.projectKey) { return false; }
+			// An inventory restricted to another source cannot cover the requested source.
+			if (filter.sourceKey && scan.requested.sourceKeys &&
+				!scan.requested.sourceKeys.includes(filter.sourceKey)) { return false; }
+			if (scan.status === 'noApplicableRules' && filter.ruleId) {
+				return scan.requested.ruleIds?.includes(filter.ruleId) === true;
+			}
+			if (filter.ruleId || filter.area || filter.category || filter.severity) {
+				return scan.selectedRules?.some(ruleMatches) === true;
+			}
+			return true;
+		};
+		const order = (scan: ScanResult): number => Number(scan.runId.split('-').at(-1)) || 0;
+		const recent = [...this.scans.values()].filter(scoped).sort((a, b) => order(b) - order(a));
 		const full = new Map<string, ScanResult>();
-		for (const scan of last.values()) {
-			if (scan.requested.mode === 'full') { full.set(scan.projectKey, scan); }
+		for (const scan of recent) {
+			if (scan.requested.mode === 'full' && !full.has(scan.projectKey)) {
+				full.set(scan.projectKey, scan);
+			}
 		}
-		const scans = [...last.values()].filter((scan) =>
-			scan.requested.mode === 'full' || !full.has(scan.projectKey) ||
-			newest(scan) > newest(full.get(scan.projectKey)!)
+		const scans = recent.filter((scan) =>
+			scan === full.get(scan.projectKey) || (!full.has(scan.projectKey) &&
+				!recent.some((other) => other.projectKey === scan.projectKey && order(other) > order(scan)))
 		).map((scan) => JSON.parse(JSON.stringify(scan)) as ScanResult);
 		const states = this.getPairStates(filter);
+		const errors: CodeStyleError[] = [...states.flatMap((state) => state.error ? [state.error] : [])];
+		const scanErrors = (scan: ScanResult): CodeStyleError[] => {
+			const rules = (scan.selectedRules ?? []).filter(ruleMatches);
+			const ruleIds = new Set(rules.map((rule) => rule.id));
+			const kinds = new Set(rules.flatMap((rule) => rule.sourceKinds));
+			return scan.errors.filter((error) => {
+				if (filter.targetKey && error.targetKey && error.targetKey !== filter.targetKey) { return false; }
+				if (filter.ruleId && error.ruleId && error.ruleId !== filter.ruleId) { return false; }
+				if (error.ruleId && !ruleIds.has(error.ruleId)) { return false; }
+				if (error.sourceKind && !kinds.has(error.sourceKind)) { return false; }
+				return !(filter.ruleId || filter.area || filter.category || filter.severity) ||
+					Boolean(error.ruleId || error.sourceKind);
+			});
+		};
+		for (const scan of scans) { errors.push(...scanErrors(scan)); }
 		const projects = new Set([...scans.map((scan) => scan.projectKey), ...states.map((state) => state.projectKey)]);
-		const stateComplete = states.every((state) => state.status === 'completed' && !state.stale && !state.error);
-		const selected = filter.targetKey || filter.uri
-			? states.length > 0 && stateComplete
-			: projects.size > 0 && [...projects].every((projectKey) => {
-				const whole = full.get(projectKey);
-				return whole ? whole.complete : scans.some((scan) =>
-					scan.projectKey === projectKey && scan.status === 'noApplicableRules');
-			}) && stateComplete;
-		const errors = [...states.flatMap((state) => state.error ? [state.error] : []),
-			...scans.flatMap((scan) => scan.errors).filter((error) =>
-				!filter.targetKey || !error.targetKey || error.targetKey === filter.targetKey)];
-		return { issues: this.getIssues(filter), scans, pairStates: states, errors, complete: selected };
+		const narrow = Boolean(filter.ruleId || filter.area || filter.category || filter.severity);
+		const scopeComplete = (scan: ScanResult): boolean => {
+			if (scan.status === 'noApplicableRules') { return scan.complete && !narrow; }
+			if (scan.inventoryCurrent === false || scan.requested.mode !== 'full' ||
+				(scan.inventoryEpoch !== undefined &&
+					this.inventoryRevision(scan.projectKey) !== scan.inventoryEpoch)) { return false; }
+			// A per-source or per-rule full run cannot attest the whole project.
+			if (!filter.sourceKey && scan.requested.sourceKeys?.length) { return false; }
+			if (filter.sourceKey && scan.requested.sourceKeys &&
+				!scan.requested.sourceKeys.includes(filter.sourceKey)) { return false; }
+			if (!narrow && scan.requested.ruleIds?.length) { return false; }
+			if (!narrow) { return scan.complete; }
+			const rules = (scan.selectedRules ?? []).filter(ruleMatches);
+			if (filter.ruleId && scan.requested.ruleIds?.length &&
+				!scan.requested.ruleIds.includes(filter.ruleId)) { return false; }
+			const kinds = new Set(rules.flatMap((rule) => rule.sourceKinds));
+			return rules.length > 0 && [...kinds].every((kind) => scan.sourceCompleteness?.[kind] === true) &&
+				scanErrors(scan).length === 0 &&
+				scan.pairs.filter((pair) => rules.some((rule) => rule.id === pair.ruleId))
+					.every((pair) => pair.status === 'completed' || pair.status === 'skipped');
+		};
+		const complete = projects.size > 0 && [...projects].every((projectKey) => {
+			const matching = states.filter((state) => state.projectKey === projectKey);
+			if (matching.some((state) => state.status !== 'completed' || state.stale || state.error)) { return false; }
+			if (filter.targetKey || filter.uri) { return matching.length > 0; }
+			const covering = full.get(projectKey);
+			if (covering) { return scopeComplete(covering); }
+			return scans.some((scan) => scan.projectKey === projectKey && !narrow &&
+				scan.status === 'noApplicableRules' && scan.complete);
+		});
+		return { issues: this.getIssues(filter), scans, pairStates: states, errors, complete };
 	}
+
 	dispose(): void {
 		if (this.disposed) { return; }
 		this.disposed = true;

@@ -16,6 +16,7 @@ export interface CodeStyleError {
 	readonly projectKey?: string;
 	readonly targetKey?: string;
 	readonly ruleId?: string;
+	readonly sourceKind?: SourceKind;
 }
 
 export interface ProjectRef {
@@ -77,6 +78,7 @@ export interface SourceInventory {
 export interface SourceSelection {
 	readonly files?: readonly string[];
 	readonly targetKeys?: readonly string[];
+	readonly sourceKeys?: readonly string[];
 }
 export interface SourceProvider {
 	readonly kind: SourceKind;
@@ -158,14 +160,22 @@ export interface RuleDefinition {
 	/** Declaration only: no fix execution exists in Task 1. */
 	readonly fix?: (issue: Issue) => unknown;
 }
+export interface ScanPair { readonly ruleId: string; readonly targetKey: string }
 export interface ScanScope {
 	readonly projectRoot: string;
 	readonly mode: 'full' | 'partial';
 	readonly files?: readonly string[];
 	readonly targetKeys?: readonly string[];
+	/** Exact (rule,target) pairs for dependency-triggered partial checks. */
+	readonly pairs?: readonly ScanPair[];
+	/** Restrict an inventory to recognized configuration/extension/external roots. */
+	readonly sourceKeys?: readonly string[];
 	readonly sourceKinds?: readonly SourceKind[];
 	readonly ruleIds?: readonly string[];
 }
+export type RuleSummary = Pick<RuleDefinition, 'id' | 'area' | 'category' | 'sourceKinds'> & { readonly severity: Severity };
+export type RuleDescriptor = Pick<RuleDefinition, 'id' | 'title' | 'description' | 'area' |
+	'category' | 'defaultSeverity' | 'defaultEnabled' | 'sourceKinds'>;
 export type ScanStatus = 'completed' | 'partial' | 'noApplicableRules' | 'cancelled' | 'stale' | 'error' | 'unsupported';
 export type PairStatus = 'completed' | 'error' | 'cancelled' | 'stale' | 'unsupported' | 'skipped';
 export interface PairResult {
@@ -179,6 +189,12 @@ export interface ScanResult {
 	readonly runId: string;
 	readonly projectKey: string;
 	readonly requested: ScanScope;
+	readonly selectedRules?: readonly RuleSummary[];
+	/** Per-kind inventory completeness for filtered result summaries. */
+	readonly sourceCompleteness?: Partial<Record<SourceKind, boolean>>;
+	readonly inventoryCurrent?: boolean;
+	/** Store inventory generation captured for this run. */
+	readonly inventoryEpoch?: number;
 	readonly actualTargets: readonly string[];
 	readonly pairs: readonly PairResult[];
 	readonly inventoryRevision?: string;
@@ -201,7 +217,7 @@ export interface IssueFilter {
 export interface IssueQueryResult {
 	readonly issues: readonly Issue[];
 	readonly scans: readonly ScanResult[];
-	readonly pairStates: readonly { projectKey: string; ruleId: string; targetKey: string; status: PairStatus; stale: boolean; error?: CodeStyleError }[];
+	readonly pairStates: readonly { projectKey: string; ruleId: string; targetKey: string; status: PairStatus; stale: boolean; area: RuleArea; category: RuleCategory; severity: Severity; sourceKey: string; error?: CodeStyleError }[];
 	readonly errors: readonly CodeStyleError[];
 	readonly complete: boolean;
 }

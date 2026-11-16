@@ -1,9 +1,16 @@
 import { createHash } from 'node:crypto';
+import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { directoryKey, sameOrUnder } from '../../../shared/projectLayout';
 import type { IssueLocation, ProjectRef, SourceRef, TargetDescriptor } from './types';
 
 export const keyOfPath = (file: string): string => directoryKey(file);
+/** Normalize file URI spelling and Windows path case for indexing and dependency tracking. */
+export function canonicalFileUri(uri: string): string {
+	const parsed = vscode.Uri.parse(uri, true);
+	if (parsed.scheme !== 'file') { throw new Error('Ожидается файловый URI.'); }
+	return vscode.Uri.file(directoryKey(parsed.fsPath)).toString();
+}
 export const projectKeyOf = (root: string): string => directoryKey(root);
 export const sourceKeyOf = (project: ProjectRef, root: Pick<SourceRef, 'kind' | 'format' | 'root'>): string =>
 	`${project.key}|${root.kind}|${root.format}|${keyOfPath(root.root)}`;

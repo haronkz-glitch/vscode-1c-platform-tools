@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { sameOrUnder } from '../../../shared/projectLayout';
+import { canonicalFileUri, projectKeyOf } from './identity';
 import { logger } from '../../../shared/logger';
 import { onDidChangeMetadataFiles } from '../../metadata/metadataFileChanges';
 import { onDidChangeProjectLayout } from '../../../shared/projectLayoutWatch';
@@ -7,13 +9,20 @@ import { RuleRegistry } from './ruleRegistry';
 import { SettingsProvider } from './settings';
 import { IssueStore, type AffectedPair } from './issueStore';
 import { ScanScheduler } from './scheduler';
-import { projectForFile, projectsForWorkspace, sourceRoots } from '../sources/projectSource';
+import { projectForFile, projectsForWorkspace, sourceForFile, sourceRoots } from '../sources/projectSource';
 import { fileFingerprint } from '../sources/bslSource';
 import type { ProjectRef, ProjectSettings, SourceKind } from './types';
 
 const log = logger.scope('code-style');
 const isWatched = (file: string): boolean => /\.(?:bsl|xml|mdo)$/i.test(file);
 const isMetadata = (file: string): boolean => /\.(?:xml|mdo)$/i.test(file);
+function variants(extension: string): string[] {
+	return [...extension].reduce<string[]>((items, letter) =>
+		items.flatMap((item) => [item + letter.toLowerCase(), item + letter.toUpperCase()]), ['']);
+}
+// Match the case-insensitive source-provider policy even on Linux.
+const BSL_GLOB = '**/*.{'+ variants('bsl').join(',') +'}';
+const METADATA_GLOB = '**/*.{'+ [...variants('xml'), ...variants('mdo')].join(',') +'}';
 
 export interface SettingsChangedEvent { readonly projectKey: string }
 /** Routes file/project/settings signals into Store invalidation and coalesced schedules. */
@@ -36,7 +45,7 @@ export class CodeStyleEvents implements vscode.Disposable {
 			vscode.workspace.onDidChangeTextDocument((event) => {
 				if (this.disposed || this.rules.list().length === 0 || event.document.uri.scheme !== 'file' ||
 					!isWatched(event.document.uri.fsPath)) { return; }
-				const uri = event.document.uri.toString();
+				const uri = canonicalFileUri(event.document.uri.toString());
 				if (event.document.isDirty) {
 					if (!this.dirty.has(uri)) {
 						this.dirty.add(uri);
@@ -49,7 +58,7 @@ export class CodeStyleEvents implements vscode.Disposable {
 				}
 			}),
 			vscode.workspace.onDidCloseTextDocument((document) => {
-				if (document.uri.scheme === 'file' && this.dirty.delete(document.uri.toString())) {
+				if (document.uri.scheme === 'file' && this.dirty.delete(canonicalFileUri(document.uri.toString()))) {
 					void this.changedFile(document.uri, true);
 				}
 			}),
@@ -57,12 +66,17 @@ export class CodeStyleEvents implements vscode.Disposable {
 				if (document.uri.scheme === 'file') { void this.changedFile(document.uri); }
 			}),
 			vscode.workspace.onDidDeleteFiles((event) => {
-				for (const uri of event.files) { void this.deletedFile(uri); }
+				for (const uri of event.files) {
+					if (isWatched(uri.fsPath)) { void this.deletedFile(uri); }
+					else { void this.deletedDirectory(uri); }
+				}
 			}),
 			vscode.workspace.onDidRenameFiles((event) => {
 				for (const file of event.files) {
-					void this.deletedFile(file.oldUri);
-					void this.changedFile(file.newUri, false, true);
+					if (isWatched(file.oldUri.fsPath)) { void this.deletedFile(file.oldUri); }
+					else { void this.deletedDirectory(file.oldUri); }
+					if (isWatched(file.newUri.fsPath)) { void this.changedFile(file.newUri, false, true); }
+					else { void this.changedDirectory(file.newUri); }
 				}
 			}),
 			onDidChangeMetadataFiles((files) => {
@@ -95,7 +109,14 @@ export class CodeStyleEvents implements vscode.Disposable {
 			const watchRoots = new Set<string>();
 			for (const project of projects) {
 				const roots = sourceRoots(project);
-				const signature = JSON.stringify(roots.map((root) => root.key).sort());
+				const cfg = vscode.workspace.getConfiguration('1c-platform-tools', vscode.Uri.file(project.root));
+				const signature = JSON.stringify([
+					roots.map((root) => root.key).sort(),
+					project.excludedRoots.map(projectKeyOf).sort(),
+					cfg.get('artifacts.exclude', []),
+					cfg.get('path.out', 'build'),
+					cfg.get('test.directoryName', 'tests'),
+				]);
 				next.set(project.key, signature);
 				const old = this.known.get(project.key);
 				const enabled = this.enabled(project);
@@ -122,8 +143,8 @@ export class CodeStyleEvents implements vscode.Disposable {
 							watcher.onDidDelete((uri) => { void this.deletedFile(uri); }));
 					};
 					// Dependencies may cross SourceKind: metadata rules can read BSL, and vice versa.
-					mkWatcher('**/*.bsl');
-					mkWatcher('**/*.{xml,mdo}');
+					mkWatcher(BSL_GLOB);
+					mkWatcher(METADATA_GLOB);
 				}
 			}
 			if (this.disposed || serial !== this.serial) {
@@ -147,14 +168,13 @@ export class CodeStyleEvents implements vscode.Disposable {
 	private rescheduleAffected(project: ProjectRef, affected: readonly AffectedPair[]): void {
 		const dependent = affected.filter((item) => item.projectKey === project.key);
 		if (!dependent.length) { return; }
-		this.scheduler.scheduleTargets(project.root,
-			[...new Set(dependent.map((item) => item.targetKey))],
-			[...new Set(dependent.map((item) => item.ruleId))]);
+		this.scheduler.schedulePairs(project.root, dependent.map(({ ruleId, targetKey }) => ({ ruleId, targetKey })));
 	}
 	private async changedFile(uri: vscode.Uri, reverted = false, created = false): Promise<void> {
 		if (this.disposed || this.rules.list().length === 0 || uri.scheme !== 'file' || !isWatched(uri.fsPath)) { return; }
-		const id = uri.toString();
-		const open = vscode.workspace.textDocuments.find((document) => document.uri.toString() === id);
+		const id = canonicalFileUri(uri.toString());
+		const open = vscode.workspace.textDocuments.find((document) =>
+			document.uri.scheme === 'file' && canonicalFileUri(document.uri.toString()) === id);
 		if (open?.isDirty) {
 			if (!this.dirty.has(id)) {
 				this.dirty.add(id);
@@ -184,14 +204,15 @@ export class CodeStyleEvents implements vscode.Disposable {
 			this.store.bumpInventory(project.key);
 			const { settings, kinds } = this.enabled(project);
 			if (!settings?.enabled || !settings.scanOnSave) { return; }
-			if (created && isMetadata(uri.fsPath) || /Configuration\.(?:xml|mdo)$/i.test(uri.fsPath)) {
-				if (kinds.has('metadata')) { this.scheduler.schedule(project.root, undefined, undefined, ['metadata']); }
-			} else if (isMetadata(uri.fsPath)) {
-				if (kinds.has('metadata')) {
-					if (affected.some((item) => item.targetUri === id)) { this.scheduler.schedule(project.root, id); }
-					else { this.scheduler.schedule(project.root, undefined, undefined, ['metadata']); }
+			if (isMetadata(uri.fsPath) && kinds.has('metadata')) {
+				const source = sourceForFile(project, uri.fsPath);
+				if (source && (created || /Configuration\.(?:xml|mdo)$/i.test(uri.fsPath) ||
+					!affected.some((item) => item.targetUri === id))) {
+					this.scheduler.scheduleSource(project.root, source.key, 'metadata');
+				} else if (source) {
+					this.scheduler.schedule(project.root, id, undefined, ['metadata']);
 				}
-			} else if (kinds.has('bsl')) {
+			} else if (!isMetadata(uri.fsPath) && kinds.has('bsl')) {
 				this.scheduler.schedule(project.root, id);
 			}
 			this.rescheduleAffected(project, affected.filter((item) => item.targetUri !== id));
@@ -202,7 +223,7 @@ export class CodeStyleEvents implements vscode.Disposable {
 	private async deletedFile(uri: vscode.Uri): Promise<void> {
 		if (this.disposed || this.rules.list().length === 0 ||
 			uri.scheme !== 'file' || !isWatched(uri.fsPath)) { return; }
-		const id = uri.toString();
+		const id = canonicalFileUri(uri.toString());
 		this.versions.delete(id);
 		this.dirty.delete(id);
 		this.scheduler.cancelForFile(id);
@@ -214,30 +235,65 @@ export class CodeStyleEvents implements vscode.Disposable {
 			const { settings, kinds } = this.enabled(project);
 			if (!settings?.enabled || !settings.scanOnSave) { return; }
 			if (isMetadata(uri.fsPath) && kinds.has('metadata')) {
-				// A deleted metadata object may change the tree and source inventory.
-				this.scheduler.schedule(project.root, undefined, undefined, ['metadata']);
+				const source = sourceForFile(project, uri.fsPath);
+				if (source) { this.scheduler.scheduleSource(project.root, source.key, 'metadata'); }
 			}
 			this.rescheduleAffected(project, affected);
 		} catch (error) {
 			log.warn('Не удалось обработать удаление ' + uri.fsPath + ': ' + String(error));
 		}
 	}
+	/** Directory URIs in VS Code rename/delete events do not have a file extension. */
+	private async deletedDirectory(uri: vscode.Uri): Promise<void> {
+		if (this.disposed || this.rules.list().length === 0 || uri.scheme !== 'file') { return; }
+		const affected = this.store.removeDirectory(canonicalFileUri(uri.toString()));
+		for (const [key] of this.known) {
+			if (!sameOrUnder(uri.fsPath, key) && !sameOrUnder(key, uri.fsPath)) { continue; }
+			this.store.bumpInventory(key);
+			if (sameOrUnder(key, uri.fsPath)) { this.scheduler.cancelProject(key); }
+		}
+		try {
+			const projects = await projectsForWorkspace();
+			for (const project of projects) {
+				if (this.disposed || !sameOrUnder(uri.fsPath, project.root)) { continue; }
+				const enabled = this.enabled(project);
+				if (enabled.settings?.enabled && enabled.settings.scanOnSave && enabled.kinds.size > 0) {
+					this.scheduler.schedule(project.root);
+					this.rescheduleAffected(project, affected);
+				}
+			}
+		} catch (error) { log.warn('Удаление каталога: ' + String(error)); }
+	}
+	private async changedDirectory(uri: vscode.Uri): Promise<void> {
+		if (this.disposed || this.rules.list().length === 0 || uri.scheme !== 'file') { return; }
+		await this.refreshProjects(true);
+		try {
+			const project = await projectForFile(uri.toString());
+			if (!project || this.disposed) { return; }
+			this.store.bumpInventory(project.key);
+			const enabled = this.enabled(project);
+			if (enabled.settings?.enabled && enabled.settings.scanOnSave && enabled.kinds.size > 0) {
+				this.scheduler.schedule(project.root);
+			}
+		} catch (error) { log.warn('Новое имя каталога: ' + String(error)); }
+	}
+
 	private async configurationChanged(event: vscode.ConfigurationChangeEvent): Promise<void> {
 		if (this.disposed || this.rules.list().length === 0 ||
 			!event.affectsConfiguration('1c-platform-tools.codeStyle')) { return; }
 		try {
-			const projects = await projectsForWorkspace();
-			for (const project of projects) {
-				if (this.disposed ||
-					!event.affectsConfiguration('1c-platform-tools.codeStyle', vscode.Uri.file(project.root))) { continue; }
-				const settings = this.settings.safeRead(project.root).settings;
-				if (!settings) { this.store.invalidateProject(project.key, false); continue; }
-				const changedRules = this.store.setRuleRevisions(project.key, Object.fromEntries(
+			// Settings revisions must be invalidated synchronously, before awaiting
+			// a possibly slow project/layout discovery.
+			for (const root of this.known.keys()) {
+				if (!event.affectsConfiguration('1c-platform-tools.codeStyle', vscode.Uri.file(root))) { continue; }
+				const settings = this.settings.safeRead(root).settings;
+				if (!settings) { this.store.invalidateProject(root, false); continue; }
+				const changedRules = this.store.setRuleRevisions(root, Object.fromEntries(
 					Object.entries(settings.rules).map(([id, rule]) => [id, rule.revision])
 				));
-				this.onSettingsChanged({ projectKey: project.key });
-				if (settings.enabled && changedRules.length) {
-					this.scheduler.schedule(project.root, undefined, changedRules);
+				this.onSettingsChanged({ projectKey: root });
+				if (settings.enabled && changedRules.length > 0) {
+					this.scheduler.schedule(root, undefined, changedRules);
 				}
 			}
 			await this.refreshProjects(false);
@@ -245,6 +301,7 @@ export class CodeStyleEvents implements vscode.Disposable {
 			log.error('Изменение Code Style settings: ' + (error instanceof Error ? error.stack ?? error.message : error));
 		}
 	}
+
 	dispose(): void {
 		if (this.disposed) { return; }
 		this.disposed = true;

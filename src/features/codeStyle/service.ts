@@ -15,19 +15,19 @@ import { ActionRegistry } from './actions/registry';
 import { ActionDispatcher } from './actions/dispatcher';
 import { registerActions } from './actions/registerActions';
 import type { JsonValue, ActionContext, ActionResult } from './actions/types';
-import type { IssueFilter, IssueQueryResult, ProjectSettings, ScanResult, ScanScope } from './core/types';
+import type { IssueFilter, IssueQueryResult, ProjectSettings, RuleDescriptor, ScanResult, ScanScope } from './core/types';
 
 /** Sole internal facade for future panel and MCP adapters; no new VS Code commands. */
 export class CodeStyleService implements vscode.Disposable {
-	readonly rules = new RuleRegistry();
-	readonly actions = new ActionRegistry();
-	readonly sources = new SourceRegistry();
-	readonly settings: SettingsProvider;
-	readonly engine = new CodeStyleEngine();
-	readonly store = new IssueStore();
-	readonly planner: ScanPlanner;
-	readonly scheduler: ScanScheduler;
-	readonly dispatcher: ActionDispatcher;
+	private readonly rules = new RuleRegistry();
+	private readonly actions = new ActionRegistry();
+	private readonly sources = new SourceRegistry();
+	private readonly settings: SettingsProvider;
+	private readonly engine = new CodeStyleEngine();
+	private readonly store = new IssueStore();
+	private readonly planner: ScanPlanner;
+	private readonly scheduler: ScanScheduler;
+	private readonly dispatcher: ActionDispatcher;
 	private readonly publisher: CodeStyleProblemsPublisher;
 	private readonly events: CodeStyleEvents;
 	private readonly settingsEmitter = new vscode.EventEmitter<SettingsChangedEvent>();
@@ -40,17 +40,14 @@ export class CodeStyleService implements vscode.Disposable {
 		registerRules(this.rules);
 		registerActions(this.actions);
 		this.settings = new SettingsProvider(this.rules);
+		this.store.setRevisionResolver((root, ruleId) => this.settings.revisionFor(root, ruleId));
 		this.sources.register(new BslSourceProvider());
 		this.sources.register(new MetadataSourceProvider(context));
 		this.planner = new ScanPlanner(this.rules, this.sources, this.settings, this.engine, this.store);
 		this.scheduler = new ScanScheduler(this.planner, this.rules, this.store);
 		this.publisher = new CodeStyleProblemsPublisher(this.store);
 		const actionContext: ActionContext = {
-			listRules: () => this.rules.list().map((rule) => ({
-				id: rule.id, title: rule.title, description: rule.description, area: rule.area,
-				category: rule.category, defaultSeverity: rule.defaultSeverity,
-				defaultEnabled: rule.defaultEnabled, sourceKinds: [...rule.sourceKinds],
-			})),
+			listRules: () => this.listRules(),
 			getSettings: (root) => {
 				const settings = this.getSettings(root);
 				return settings ? JSON.parse(JSON.stringify(settings)) as ProjectSettings : undefined;
@@ -66,7 +63,13 @@ export class CodeStyleService implements vscode.Disposable {
 		disposables?: vscode.Disposable[]): vscode.Disposable =>
 		this.scheduler.onDidChangeScanState(listener, thisArgs, disposables);
 
-	listRules(): ReturnType<RuleRegistry['list']> { return this.rules.list(); }
+	listRules(): readonly RuleDescriptor[] {
+		return this.rules.list().map((rule) => ({
+			id: rule.id, title: rule.title, description: rule.description, area: rule.area,
+			category: rule.category, defaultSeverity: rule.defaultSeverity,
+			defaultEnabled: rule.defaultEnabled, sourceKinds: [...rule.sourceKinds],
+		}));
+	}
 	getSettings(projectRoot: string): ProjectSettings | undefined {
 		return this.settings.safeRead(projectRoot).settings;
 	}

@@ -1,28 +1,33 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { createHash } from 'node:crypto';
 import * as vscode from 'vscode';
 import { sameOrUnder } from '../../../shared/projectLayout';
 import { stableHash, targetCompare, targetKeyOf } from '../core/identity';
-import { SourceDataError } from '../core/sourceVersion';
-import type { CodeStyleError, ProjectRef, SourceInventory, SourceProvider, SourceSelection, TargetDescriptor, TargetSnapshot } from '../core/types';
-import { ensureSafeFile, filePath, fileUri, sourceForFile, sourceRoots, sameFile } from './projectSource';
+import { persistedVersion, readPersisted, SourceDataError } from '../core/sourceVersion';
+import type {
+	CodeStyleError, ProjectRef, SourceInventory, SourceProvider, SourceSelection, TargetDescriptor, TargetSnapshot,
+} from '../core/types';
+import {
+	ensureSafeFile, filePath, fileUri, sourceForFile, sourceRoots, sameFile, type TrustedRoots,
+} from './projectSource';
 
-// Layout discovery deliberately skips "Ext"; BSL scanning MUST NOT copy that exclusion.
+// The project-discovery exclusions contain Ext, but Ext holds real BSL modules.
 const SKIP = new Set(['node_modules', 'oscript_modules', '.git', '.vscode', 'out', 'build', 'dist', 'target', 'coverage']);
-function skipBslDirectory(project: ProjectRef, directory: string): boolean {
-	const relative = path.relative(project.root, directory);
-	if (relative.startsWith('..') || path.isAbsolute(relative)) { return true; }
+function excludedDirectories(project: ProjectRef): ReadonlySet<string> {
 	const cfg = vscode.workspace.getConfiguration('1c-platform-tools', vscode.Uri.file(project.root));
 	const configured = cfg.get<string[]>('artifacts.exclude', []);
-	const build = cfg.get<string>('path.out', 'build').replace(/\\/g, '/').replace(/^\.\/?/, '').split('/')[0];
-	const exclusions = new Set([...SKIP, build, ...configured
-		.map((value) => value.replace(/\\/g, '/').replace(/^\.\/?|\/$/g, ''))
-		.filter((value) => value.length > 0 && !value.includes('/'))]);
-	return relative.split(/[\\/]/).some((segment) => segment.startsWith('.') || exclusions.has(segment));
+	const output = cfg.get<string>('path.out', 'build').replace(/\\/g, '/').replace(/^\.\/?/, '').split('/')[0];
+	return new Set([...SKIP, output, ...configured
+		.map((name) => name.replace(/\\/g, '/').replace(/^\.\/?|\/$/g, ''))
+		.filter((name) => name !== '' && !name.includes('/'))].filter(Boolean));
+}
+function excluded(project: ProjectRef, directory: string, names: ReadonlySet<string>): boolean {
+	const relative = path.relative(project.root, directory);
+	if (relative.startsWith('..') || path.isAbsolute(relative)) { return true; }
+	return relative.split(/[\\/]/).some((part) => part.startsWith('.') || names.has(part));
 }
 export async function fileFingerprint(file: string): Promise<string> {
-	return createHash('sha1').update(await fs.readFile(file)).digest('hex');
+	return persistedVersion(fileUri(file));
 }
 export class BslSourceProvider implements SourceProvider {
 	readonly kind = 'bsl' as const;
@@ -31,21 +36,28 @@ export class BslSourceProvider implements SourceProvider {
 		const targets: TargetDescriptor[] = [];
 		const errors: CodeStyleError[] = [];
 		const visited = new Set<string>();
+		const names = excludedDirectories(project);
+		const roots = sourceRoots(project).filter((root) => !selection.sourceKeys || selection.sourceKeys.includes(root.key));
 		let complete = true;
-		const add = async (file: string): Promise<void> => {
-			if (!file.toLowerCase().endsWith('.bsl')) { return; }
+		const error = (code: string, file: string, problem: unknown): void => {
+			complete = false;
+			errors.push({ code, projectKey: project.key, message: file + ': ' + String(problem) });
+		};
+		const add = async (file: string, known?: TrustedRoots): Promise<void> => {
+			if (!/\.bsl$/i.test(file)) { return; }
 			const source = sourceForFile(project, file);
-			if (!source || skipBslDirectory(project, path.dirname(file))) { return; }
-			const requestedKey = targetKeyOf(source, this.kind, file);
-			if ((selection.targetKeys || selection.files) &&
-				!selection.targetKeys?.includes(requestedKey) &&
+			if (!source || !roots.some((root) => root.key === source.key) || excluded(project, path.dirname(file), names)) {
+				return;
+			}
+			const targetKey = targetKeyOf(source, this.kind, file);
+			if ((selection.files || selection.targetKeys) &&
+				!selection.targetKeys?.includes(targetKey) &&
 				!selection.files?.some((uri) => {
 					const requested = filePath(uri);
 					return requested !== undefined && sameFile(requested, file);
 				})) { return; }
 			try {
-				await ensureSafeFile(project, file, source);
-				const targetKey = targetKeyOf(source, this.kind, file);
+				await ensureSafeFile(project, file, source, known);
 				if (!visited.has(targetKey)) {
 					visited.add(targetKey);
 					targets.push({
@@ -53,16 +65,12 @@ export class BslSourceProvider implements SourceProvider {
 						uri: fileUri(file), sourceRoot: source.root, format: source.format,
 					});
 				}
-			} catch (error) {
-				complete = false;
-				errors.push({ code: 'bslFileUnavailable', projectKey: project.key, message: String(error) });
-			}
+			} catch (problem) { error('bslFileUnavailable', file, problem); }
 		};
 		if (selection.files || selection.targetKeys) {
 			const files = [...(selection.files ?? []), ...(selection.targetKeys ?? []).map((key) => {
-				const marker = '|bsl|';
-				const i = key.lastIndexOf(marker);
-				return i < 0 ? '' : fileUri(key.slice(i + marker.length));
+				const marker = '|bsl|', at = key.lastIndexOf(marker);
+				return at < 0 ? '' : fileUri(key.slice(at + marker.length));
 			})];
 			for (const uri of files) {
 				if (token.isCancellationRequested) { complete = false; break; }
@@ -70,66 +78,71 @@ export class BslSourceProvider implements SourceProvider {
 				if (file) { await add(file); }
 			}
 		} else {
-			const walk = async (directory: string): Promise<void> => {
-				if (token.isCancellationRequested) { complete = false; return; }
-				let entries: import('node:fs').Dirent[];
-				try { entries = await fs.readdir(directory, { withFileTypes: true }); }
-				catch (error) {
-					complete = false;
-					errors.push({ code: 'bslEnumerate', projectKey: project.key, message: String(error) });
-					return;
-				}
-				entries.sort((a, b) => a.name.localeCompare(b.name));
-				for (const entry of entries) {
-					if (token.isCancellationRequested) { complete = false; return; }
-					const file = path.join(directory, entry.name);
-					if (entry.isDirectory()) {
-						if (!entry.name.startsWith('.') && !SKIP.has(entry.name) &&
-							!project.excludedRoots.some((excluded) => sameOrUnder(file, excluded)) && !skipBslDirectory(project, file)
-							&& sourceForFile(project, file)) {
-							await walk(file);
-						}
-					} else if (entry.isFile() && entry.name.toLowerCase().endsWith('.bsl')) {
-						await add(file);
-					}
-				}
-			};
-			for (const root of sourceRoots(project)) {
+			let realProject: string;
+			try { realProject = await fs.realpath(project.root); }
+			catch (problem) {
+				return { targets: [], revision: '', complete: false,
+					errors: [{ code: 'bslProjectUnavailable', projectKey: project.key, message: String(problem) }] };
+			}
+			for (const source of roots) {
 				if (token.isCancellationRequested) { complete = false; break; }
-				if (!sameOrUnder(root.root, project.root)) { continue; }
+				const seen = new Set<string>();
+				let realSource: string;
 				try {
-					const [realProject, realSource] = await Promise.all([
-						fs.realpath(project.root), fs.realpath(root.root),
-					]);
-					if (!sameOrUnder(realSource, realProject)) {
-						throw new Error('Корень BSL-источника выходит за границу проекта.');
+					realSource = await fs.realpath(source.root);
+					if (!sameOrUnder(realSource, realProject)) { throw new Error('Источник выходит за границы проекта.'); }
+				} catch (problem) { error('bslSourceUnavailable', source.root, problem); continue; }
+				const trusted: TrustedRoots = { projectReal: realProject, sourceReal: realSource };
+				const walk = async (directory: string): Promise<void> => {
+					if (token.isCancellationRequested) { complete = false; return; }
+					let real: string;
+					try {
+						real = await fs.realpath(directory);
+						if (!sameOrUnder(real, realSource)) { throw new Error('Ссылка выходит за границы источника.'); }
+						if (seen.has(real)) { throw new Error('Повторный обход через символическую ссылку или цикл.'); }
+						seen.add(real);
+					} catch (problem) { error('bslDirectoryUnsafe', directory, problem); return; }
+					let entries: import('node:fs').Dirent[];
+					try { entries = await fs.readdir(directory, { withFileTypes: true }); }
+					catch (problem) { error('bslEnumerate', directory, problem); return; }
+					entries.sort((a, b) => a.name.localeCompare(b.name));
+					for (const entry of entries) {
+						if (token.isCancellationRequested) { complete = false; return; }
+						const file = path.join(directory, entry.name);
+						let isDir = entry.isDirectory(), isFile = entry.isFile();
+						if (entry.isSymbolicLink()) {
+							try {
+								const stat = await fs.stat(file);
+								isDir = stat.isDirectory();
+								isFile = stat.isFile();
+							} catch (problem) { error('bslSymlinkUnavailable', file, problem); continue; }
+						}
+						if (isDir) {
+							if (!excluded(project, file, names) &&
+								!project.excludedRoots.some((root) => sameOrUnder(file, root)) &&
+								sourceForFile(project, file)?.key === source.key) { await walk(file); }
+						} else if (isFile && /\.bsl$/i.test(file)) {
+							await add(file, trusted);
+						}
 					}
-					await walk(root.root);
-				} catch (error) {
-					complete = false;
-					errors.push({ code: 'bslSourceUnavailable', projectKey: project.key, message: String(error) });
-				}
+				};
+				await walk(source.root);
 			}
 		}
 		targets.sort(targetCompare);
-		return { targets, complete, errors, revision: stableHash(...targets.map((t) => t.targetKey)) };
+		return { targets, complete, errors, revision: stableHash(...targets.map((target) => target.targetKey)) };
 	}
 
 	async read(project: ProjectRef, target: TargetDescriptor, token: vscode.CancellationToken): Promise<TargetSnapshot> {
-		if (token.isCancellationRequested) { throw new Error('Операция отменена.'); }
+		if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
 		const file = filePath(target.uri);
 		const source = file && sourceForFile(project, file);
-		if (!file || !source || source.key !== target.sourceKey) { throw new Error('BSL-цель больше не принадлежит источнику.'); }
-		const open = vscode.workspace.textDocuments.find((document) => document.uri.toString() === target.uri);
-		if (open?.isDirty) { throw new SourceDataError('dirtySource', 'Файл BSL не сохранён.'); }
+		if (!file || !source || source.key !== target.sourceKey) {
+			throw new SourceDataError('unsupportedSource', 'BSL-цель больше не принадлежит источнику.');
+		}
 		await ensureSafeFile(project, file, source);
-		const bytes = await fs.readFile(file);
+		const snapshot = await readPersisted(target.uri);
 		if (token.isCancellationRequested) { throw new SourceDataError('cancelled', 'Операция отменена.'); }
-		if (open?.isDirty) { throw new SourceDataError('dirtySource', 'Файл BSL изменён в редакторе.'); }
-		return {
-			kind: this.kind, uri: target.uri,
-			version: createHash('sha1').update(bytes).digest('hex'),
-			text: bytes.toString('utf8'),
-		};
+		return { kind: this.kind, uri: target.uri, version: snapshot.version, text: snapshot.text };
 	}
 }

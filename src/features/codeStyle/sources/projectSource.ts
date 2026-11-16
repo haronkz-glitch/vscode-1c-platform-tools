@@ -103,12 +103,18 @@ export function filePath(uri: string): string | undefined {
 	} catch { return undefined; }
 }
 /** Both lexical and real paths must remain inside the selected project/source boundary. */
-export async function ensureSafeFile(project: ProjectRef, file: string, source?: SourceRef): Promise<void> {
+export interface TrustedRoots { readonly projectReal: string; readonly sourceReal?: string }
+export async function ensureSafeFile(
+	project: ProjectRef, file: string, source?: SourceRef, trusted?: TrustedRoots
+): Promise<void> {
 	if (!sameOrUnder(file, project.root) || (source && !sameOrUnder(file, source.root))) {
 		throw new Error('Файл вне разрешённой области проекта.');
 	}
 	const [projectReal, fileReal, sourceReal] = await Promise.all([
-		fs.realpath(project.root), fs.realpath(file), source ? fs.realpath(source.root) : Promise.resolve(undefined),
+		trusted ? Promise.resolve(trusted.projectReal) : fs.realpath(project.root),
+		fs.realpath(file),
+		trusted ? Promise.resolve(trusted.sourceReal) :
+			source ? fs.realpath(source.root) : Promise.resolve(undefined),
 	]);
 	if (!sameOrUnder(fileReal, projectReal) || (sourceReal && (!sameOrUnder(sourceReal, projectReal) || !sameOrUnder(fileReal, sourceReal)))) {
 		throw new Error('Символическая ссылка выходит за разрешённую область проекта.');
