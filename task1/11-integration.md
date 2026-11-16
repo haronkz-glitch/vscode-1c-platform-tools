@@ -48,7 +48,7 @@
 
 **ID-001-11-0020** - Полная и частичная проверки, удаление, settings change, несколько проектов и поздние результаты обслуживаются согласованными механизмами Store/Scheduler. Проверка не должна удалять замечания не относящихся к её scope правил или проектов.
 
-**ID-001-11-0021** - Реализацию проверять штатными `npm run typecheck`, `npm run lint`, `npm run compile` и `npm test`. Автор требует проверки перед PR; конкретные тесты и тестовые сценарии разрабатывает агент-кодер, эти спецификации их не проектируют.
+**ID-001-11-0021** - Реализацию проверять штатными `npm run typecheck`, `npm run lint`, `npm run compile` и `npm test`. **Перечень обязательных тестов, их сценарии, ожидаемые результаты и критерии приёмки заданы в [12-tests.md](12-tests.md)**; агент-кодер должен реализовать и запустить их по этой спецификации, а не самостоятельно проектировать тестовое покрытие. Автор оригинального репозитория требует проверок перед PR.
 
 **ID-001-11-0022** - Для будущего PR в оригинал соблюдать [CONTRIBUTING.md](https://github.com/yellow-hammer/vscode-1c-platform-tools/blob/main/CONTRIBUTING.md), [PR template](https://github.com/yellow-hammer/vscode-1c-platform-tools/blob/main/.github/PULL_REQUEST_TEMPLATE.md) и [CI](https://github.com/yellow-hammer/vscode-1c-platform-tools/blob/main/.github/workflows/ci.yml): фокус одного PR, Conventional Commits по-русски в прошедшем времени множественного числа, документация при изменении UX; `CHANGELOG.md` вручную не редактировать.
 
