@@ -194,6 +194,8 @@ export class ScanPlanner {
 		if (token.isCancellationRequested) { status = 'cancelled'; }
 		else if (unsupported && inventories.size === 0) { status = 'unsupported'; }
 		else if (missing.length > 0 && checkedTargets.size === 0) { status = 'unsupported'; }
+		else if (pairs.length > 0 && pairs.every((pair) =>
+			pair.status === 'unsupported' || pair.status === 'skipped')) { status = 'unsupported'; }
 		else if (finished && allSkipped) { status = 'noApplicableRules'; }
 		else if (finished) { status = 'completed'; }
 		else { status = checkedTargets.size === 0 ? 'error' : 'partial'; }

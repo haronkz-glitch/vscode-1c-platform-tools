@@ -133,7 +133,9 @@ export class CodeStyleEngine {
 				results.push({ ruleId: rule.id, target, status: 'completed', issues, sourceVersion, dependencies });
 			} catch (error) {
 				const resolved = error instanceof SourceDataError ? error : sourceError(error, 'ruleCheckFailed');
-				const status: PairStatus = resolved.code === 'cancelled' ? 'cancelled' : 'error';
+				const status: PairStatus = resolved.code === 'cancelled' ? 'cancelled'
+					: resolved.code === 'unsupportedSource' ? 'unsupported'
+						: (resolved.code === 'dirtySource' || resolved.code === 'staleSource') ? 'stale' : 'error';
 				results.push(failure(rule, status, resolved.code, resolved, sourceVersion));
 			}
 		}
